@@ -49,10 +49,10 @@ export async function run({page,context,origin,work,assert,fixtures}) {
     await publicPage.goto(publicUrl);await exercise(publicPage);
     const oldSrc=await publicPage.locator('.web-presentation iframe').getAttribute('src');
     await panel.getByRole('button',{name:'关闭分享',exact:true}).click();await panel.getByText('已关闭',{exact:true}).waitFor();
-    assert.equal((await guest.request.get(origin+oldSrc)).status(),404);assert.equal((await guest.request.head(origin+oldSrc)).status(),404);
+    assert.equal((await guest.request.get(new URL(oldSrc,origin).href)).status(),404);assert.equal((await guest.request.head(new URL(oldSrc,origin).href)).status(),404);
     await publicPage.evaluate(()=>window.dispatchEvent(new Event('focus')));await publicPage.locator('.web-presentation iframe').waitFor({state:'detached'});
     await panel.getByRole('button',{name:'重新开启分享（30 天）',exact:true}).click();await link.waitFor();assert.equal(await link.inputValue(),publicUrl);
-    assert.equal((await guest.request.get(origin+oldSrc)).status(),404);
+    assert.equal((await guest.request.get(new URL(oldSrc,origin).href)).status(),404);
     await publicPage.goto(publicUrl);await publicPage.frameLocator('.web-presentation iframe').locator('#add').waitFor();
     fixtures.setExpiry(web.id,new Date(Date.now()-1000).toISOString());
     assert.equal((await guest.request.head(`/api/files/${web.id}/preview/public`.replace(/^/,origin))).status(),404);
