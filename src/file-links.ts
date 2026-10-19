@@ -1,7 +1,7 @@
 import { BASE_PATH, fileUrl, type WorkFile } from "./api";
 
 export type ResolvedMessageLink =
-  | { kind: "preview"; href: string }
+  | { kind: "preview"; href: string; web?: boolean }
   | { kind: "raw"; href: string }
   | { kind: "download"; href: string }
   | { kind: "unavailable"; path?: string }
@@ -116,7 +116,7 @@ export function resolveMessageFileLink(href: string | undefined, files: WorkFile
   const matched = exact ?? named;
   if (matched) {
     const readerKind = fileReaderKind(matched.file);
-    if (readerKind === "html" || readerKind === "pdf" || readerKind === "epub") return { kind: "preview", href: filePreviewUrl(matched.file) };
+    if (readerKind === "html" || readerKind === "pdf" || readerKind === "epub") return { kind: "preview", href: filePreviewUrl(matched.file), ...(matched.file.presentation_mode === "web" ? { web: true } : {}) };
     if (readerKind === "markdown") return { kind: "raw", href: fileUrl(matched.file) };
     return { kind: "download", href: fileUrl(matched.file, true) };
   }

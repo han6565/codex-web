@@ -6,7 +6,7 @@ export type TaskRecoveryCheckpoint = {
   threadId: string | null;
   project?: { id: string; root: string; executor: string };
   capturedAt: string;
-  reason: "capacity" | "cancelled" | "failed" | "interrupted";
+  reason: "capacity" | "upstream" | "cancelled" | "failed" | "interrupted";
   goalExcerpt: string;
   priorGoalExcerpt?: string;
   inputAccepted: boolean;

@@ -2,11 +2,13 @@
 
 ## Document contract
 
+This contract is for `reader` reports. Choose the output in `SKILL.md` first; interactive explainers follow `interactive-web.md` instead.
+
 - Produce one complete HTML5 document encoded as UTF-8.
 - Include `<meta charset="utf-8">` near the start of `<head>` and `<meta name="viewport" content="width=device-width, initial-scale=1">`.
 - Keep CSS inline in a `<style>` element. Embed images as data URIs or inline SVG. External `http(s)` links are allowed only as user-activated citations or references.
 - Avoid scripts, forms, iframes, objects, and embeds. The Codex Web reader strips those active elements and inline event handlers, then renders the remaining static HTML in its own page DOM.
-- Keep the finished file below 5 MiB when browser reading is expected; larger files are download-only.
+- Prefer files below 5 MiB for quick loading and public sharing. The private reader currently supports up to 100 MiB; web and public reading are limited to 5 MiB. Large images still need deliberate compression.
 
 ## Reading layout
 
@@ -30,7 +32,7 @@
 
 - Start with the answer, executive conclusion, or decision-relevant summary.
 - Make key claims explicit in text. A reader should not need to decode color, decoration, or a dashboard arrangement to find the conclusion.
-- Use a table for exact mappings and repeated comparisons; a flow/timeline for sequence; a tree for hierarchy. Skip decorative dashboards.
+- Choose explanatory visuals using [visual-explanation.md](visual-explanation.md). Skip decorative dashboards.
 - Avoid turning ordinary paragraphs into cards. Use a bordered or tinted group only when the boundary itself conveys meaning, such as a conclusion, warning, comparison, or grouped evidence.
 - When two views materially benefit from side-by-side comparison, use a responsive grid on wide screens and stack it below about 760px.
 - Every chart needs a title, direct labels or legend, units where relevant, and a prose conclusion. Prefer static inline SVG or locally generated raster images.

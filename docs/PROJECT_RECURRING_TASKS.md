@@ -51,3 +51,7 @@
 
 
 The compact editor reuses the conversation model/effort menus. Long intervals display days/hours/minutes; expanded project folders wait for both recurring tasks and the initial conversation page. Failed list loading offers retry. Opportunity discovery may link a native task; a new linked task starts paused, and hiding the optional cards feature does not silently disable an existing schedule.
+
+## Daily windows and one-time checks
+
+Daily schedules can use multiple fixed times or bounded time windows with intervals. Each definition records its IANA timezone. Preview the next occurrences in the editor before saving. One-time schedules persist an absolute timestamp and fire at most once through the existing project queue. Optional judgment checks share the same queue and deduplication rules; no extra scheduler or model process is installed.

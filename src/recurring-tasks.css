@@ -123,3 +123,19 @@
 .project-skills-dialog.ui-dialog footer { gap: 16px; }
 @media (max-width: 720px) { .project-skills-dialog.ui-dialog { width: 100%; max-height: 94dvh; padding: 16px; border-radius: 20px 20px 0 0; } .project-skills-body { grid-template-columns: minmax(0,1fr); } .project-skills-list { border-right: 0; border-bottom: 1px solid var(--line); padding: 0 0 12px; max-height: 190px; overflow-y: auto; } .project-skills-dialog.ui-dialog footer { flex-wrap: wrap; } }
 @media (min-width: 721px) { .recurring-workspace button.mobile-only { display: none; } }
+
+.recurring-intraday, .recurring-preview { display: grid; gap: 12px; min-width: 0; }
+.recurring-intraday p, .recurring-preview p { margin: 0; color: var(--dialog-text-secondary); font-size: var(--dialog-font-secondary); line-height: 1.6; }
+.recurring-window, .recurring-preview { border: 1px solid var(--line); border-radius: 10px; padding: 12px; }
+.recurring-window > strong { display: block; margin-bottom: 8px; font-size: var(--dialog-font-secondary); }
+.recurring-window button { align-self: end; }
+.recurring-intraday > button { justify-self: start; }
+.recurring-time-nodes { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 190px), 1fr)); gap: 12px; }
+.recurring-time-node { display: flex; align-items: end; gap: 8px; min-width: 0; }
+.recurring-time-node label { flex: 1; min-width: 0; }
+.recurring-preview h4 { margin: 0; font-size: var(--dialog-font-heading); overflow-wrap: anywhere; }
+.recurring-preview-nodes { display: flex; flex-wrap: wrap; gap: 8px; }
+.recurring-preview-nodes span { border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; font-size: var(--dialog-font-secondary); font-variant-numeric: tabular-nums; }
+.recurring-preview summary { cursor: pointer; font-size: var(--dialog-font-secondary); }
+.recurring-preview ol { padding-left: 24px; font-size: var(--dialog-font-secondary); line-height: 1.8; }
+.recurring-card > span { overflow-wrap: anywhere; }

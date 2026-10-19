@@ -1,3 +1,4 @@
+export type OpportunityImage = { id: string; url: string; alt: string; caption: string; width: number; height: number; state: 'local' | 'cold' | 'restoring' | 'error' | 'unavailable'; conversation_id: string };
 import type { RecurringTask } from './recurring-types.js';
 export type OpportunityTopic = {
   id: string; user_id: string; project_id: string; task_id: string | null; name: string; goal: string;
@@ -15,6 +16,7 @@ export type OpportunityContent = {
 };
 export type OpportunityState = 'pending' | 'reserve' | 'recommended' | 'kept' | 'later' | 'dismissed' | 'internal_rejected' | 'expired' | 'project' | 'duplicate';
 export type OpportunityIdea = {
+  images?: OpportunityImage[];
   id: string; user_id: string; topic_id: string; content: OpportunityContent; state: OpportunityState;
   score: number | null; quality: number; review_reason: string; state_reason: string; rating: number | null; note: string;
   fingerprint: string; duplicate_of: string | null; first_created_at: string; last_reviewed_at: string | null;
@@ -31,7 +33,8 @@ export type OpportunityBatch = {
 export type OpportunityFeedback = { id: string; idea_id: string; action: string; reason: string; rating: number | null; note: string; actor: string; created_at: string; previous_json: string };
 export type OpportunityPreference = { id: string; topic_id: string; text: string; kind: 'explicit' | 'inferred'; scope: 'topic' | 'project' | 'account'; source: string; active: number; created_at: string; updated_at: string };
 export type OpportunityResearch = { id: string; idea_id: string; conversation_id: string; status: string; result: string; created_at: string; updated_at: string };
-export type OpportunityDetail = { sourceBatch: OpportunityBatch; recommendedBatch: OpportunityBatch | null; availableConversations: string[]; idea: OpportunityIdea; feedback: OpportunityFeedback[]; versions: Array<{ id: string; reason: string; created_at: string; conversation_id: string; project_id?: string | null; content_json: string }>; research: OpportunityResearch[] };
+export type OpportunityVoiceFeedback = { id: string; state: "queued" | "processing" | "failed" | "completed"; transcript: string; applied_revision: number | null; error: string | null; created_at: string };
+export type OpportunityDetail = { voiceFeedback: OpportunityVoiceFeedback[]; sourceBatch: OpportunityBatch; recommendedBatch: OpportunityBatch | null; availableConversations: string[]; idea: OpportunityIdea; feedback: OpportunityFeedback[]; versions: Array<{ id: string; reason: string; created_at: string; conversation_id: string; project_id?: string | null; content_json: string }>; research: OpportunityResearch[] };
 export type OpportunityCollection = 'screen' | 'reserve' | 'working' | 'processed' | 'dismissed' | 'rejected';
 export type OpportunityWork = {
   research: { status: string; result: string; conversation_id: string; project_id: string; available: boolean } | null;

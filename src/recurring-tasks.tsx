@@ -4,29 +4,29 @@ import { api, type AgentOptions, type Project } from "./api";
 import type { Recurrence, RecurringInput, RecurringRun, RecurringTask } from "./recurring-types";
 import { SettingMenu, type SettingMenuOption } from "./conversation/SettingMenu";
 import "./recurring-tasks.css";
+import { changeRecurrenceKind, RecurringScheduleFields, IntradayPreview } from "./recurring-schedule";
 import { recurrenceLabel } from "./recurring-labels";
 
 export const recurringState = (s: RecurringTask["state"]) => ({ active: "已启用", paused: "已暂停", completed: "已完成" })[s];
-const weekdays = ["日", "一", "二", "三", "四", "五", "六"];
 const dateText = (value: string | null, zone?: string) => value ? new Intl.DateTimeFormat("zh-CN", { timeZone: zone, dateStyle: "medium", timeStyle: "short", hourCycle: "h23" }).format(new Date(value)) : "—";
 
 export function RecurringSidebar({ tasks, selected, onOpen }: { tasks: RecurringTask[]; selected: string | null; onOpen: (id: string | null) => void }) {
   const [expanded, setExpanded] = useState(false);
   if (!tasks.length) return null;
-  return <div className="recurring-sidebar"><button className="recurring-group" aria-expanded={expanded} onClick={() => setExpanded(!expanded)}><Repeat2 size={15} /><span>周期任务（{tasks.length}）</span><ChevronDown size={14} style={{ transform: expanded ? undefined : "rotate(-90deg)" }} /></button>{expanded && <div className="recurring-children">{tasks.map(t => <button key={t.id} className={selected === t.id ? "selected" : ""} onClick={() => onOpen(t.id)} title={`${t.name} · ${recurringState(t.state)}`}><CalendarClock size={14} /><span>{t.name}</span>{t.state !== "active" && <Pause size={12} aria-label={recurringState(t.state)} />}</button>)}<button className="recurring-manage" onClick={() => onOpen(null)}>管理定时任务</button></div>}</div>;
+  return <div className="recurring-sidebar"><button className="recurring-group" aria-expanded={expanded} onClick={() => setExpanded(!expanded)}><Repeat2 size={15} /><span>{tasks.some(t=>t.schedule.kind==='once')?'定时任务':'周期任务'}（{tasks.length}）</span><ChevronDown size={14} style={{ transform: expanded ? undefined : "rotate(-90deg)" }} /></button>{expanded && <div className="recurring-children">{tasks.map(t => <button key={t.id} className={selected === t.id ? "selected" : ""} onClick={() => onOpen(t.id)} title={`${t.name} · ${recurringState(t.state)}`}><CalendarClock size={14} /><span>{t.name}</span>{t.state !== "active" && <Pause size={12} aria-label={recurringState(t.state)} />}</button>)}<button className="recurring-manage" onClick={() => onOpen(null)}>管理定时任务</button></div>}</div>;
 }
 
-export function RecurringWorkspace({ project, tasks, taskId, loading, loadError, onOpen, onChanged, onMenu, onConversation, onDirty, onReturnOpportunity, onOpportunity }: { onReturnOpportunity?: () => void; onOpportunity?: (id: string) => void; project: Project; tasks: RecurringTask[]; taskId: string | null; loading: boolean; loadError: string; onOpen: (id: string | null) => void; onChanged: () => Promise<void>; onMenu: () => void; onConversation: (id: string) => void; onDirty: (dirty: boolean) => void }) {
+export function RecurringWorkspace({ project, tasks, taskId, loading, loadError, onOpen, onChanged, onMenu, onConversation, onDirty, onOpportunity, onJudgment }: { onJudgment?: (id:string) => void; onOpportunity?: (id: string) => void; project: Project; tasks: RecurringTask[]; taskId: string | null; loading: boolean; loadError: string; onOpen: (id: string | null) => void; onChanged: () => Promise<void>; onMenu: () => void; onConversation: (id: string) => void; onDirty: (dirty: boolean) => void }) {
   const [error, setError] = useState("");
   const [waits, setWaits] = useState<Array<{ id: string; label: string; deadline_at: string; conversation_id: string }>>([]);
   useEffect(() => { let disposed = false; api.projectScheduledWaits(project.id).then(r => { if (!disposed) setWaits(r.waits); }).catch(e => { if (!disposed) setError(e.message); }); return () => { disposed = true; }; }, [project.id, taskId]);
   return <main className="workspace recurring-workspace ui-dialog">
     <header className="workspace-header"><div className="recurring-heading"><button className="icon-button mobile-only" onClick={onMenu} aria-label="打开侧栏"><Menu size={20} /></button><CalendarClock size={22} /><div><h1>定时任务</h1><p>{project.display_name || project.name}</p></div></div><button type="button" onClick={() => onOpen("new")}><Plus size={17} />新建周期任务</button></header>
-    <div className="recurring-content">{onReturnOpportunity && <button onClick={onReturnOpportunity}>返回机会卡片</button>}{taskId ? <RecurringEditor onOpportunity={onOpportunity} key={`${project.id}:${taskId}`} project={project} taskId={taskId} onSaved={async id => { await onChanged(); onOpen(id); }} onBack={() => onOpen(null)} onConversation={onConversation} onDirty={onDirty} /> : <>
-      <div className="recurring-section-title"><div><h2>周期任务</h2><p>到点在此项目中新建会话，按保存的指令独立执行。</p></div><button onClick={() => void onChanged().catch(e => setError(e.message))} aria-label="刷新定时任务"><RefreshCw size={17} /></button></div>
+    <div className="recurring-content">{taskId ? <RecurringEditor onJudgment={onJudgment} onOpportunity={onOpportunity} key={`${project.id}:${taskId}`} project={project} taskId={taskId} onSaved={async id => { await onChanged(); onOpen(id); }} onBack={() => onOpen(null)} onConversation={onConversation} onDirty={onDirty} /> : <>
+      <div className="recurring-section-title"><div><h2>{tasks.some(t=>t.schedule.kind==='once')?'定时任务':'周期任务'}</h2><p>到点在此项目中新建会话，按保存的指令独立执行。</p></div><button onClick={() => void onChanged().catch(e => setError(e.message))} aria-label="刷新定时任务"><RefreshCw size={17} /></button></div>
       {loading && <p role="status">正在加载定时任务…</p>}{loadError && <p role="alert" className="recurring-error">{loadError}，请点击刷新重试。</p>}
       {!loading && !loadError && !tasks.length && <div className="recurring-empty"><Repeat2 size={32} /><h3>让重复的工作按时开始</h3><p>设置指令、模型和日程，后续执行由服务器安排。</p><button className="primary-button" onClick={() => onOpen("new")}><Plus size={17} />创建第一个周期任务</button></div>}
-      <div className="recurring-list">{tasks.map(t => <button className="recurring-card" key={t.id} onClick={() => onOpen(t.id)}><span className="recurring-card-title"><Repeat2 size={18} /><strong>{t.name}</strong><span className={`recurring-status ${t.state}`}>{recurringState(t.state)}</span></span><span>{recurrenceLabel(t.schedule)} · {t.schedule.timeZone}</span><small>下次：{dateText(t.nextRunAt, t.schedule.timeZone)} · 已执行 {t.runCount}{t.maxRuns === null ? " 次" : ` / ${t.maxRuns} 次`}</small></button>)}</div>
+      <div className="recurring-list">{tasks.map(t => <button className="recurring-card" key={t.id} onClick={() => onOpen(t.id)}><span className="recurring-card-title"><Repeat2 size={18} /><strong>{t.name}</strong><span className={`recurring-status ${t.state}`}>{t.schedule.kind==='once'&&t.state==='completed'?'已触发':recurringState(t.state)}</span></span><span>{recurrenceLabel(t.schedule)} · {t.schedule.timeZone}</span><small>下次：{dateText(t.nextRunAt, t.schedule.timeZone)} · 已执行 {t.runCount}{t.maxRuns === null ? " 次" : ` / ${t.maxRuns} 次`}</small></button>)}</div>
       <section className="recurring-waits"><h2>会话内的延时任务</h2><p>在会话菜单的“安排自动续跑”中创建，可继续当前会话或新建会话。</p>{waits.length ? waits.map(w => <button key={w.id} onClick={() => onConversation(w.conversation_id)}><CalendarClock size={16} /><span>{w.label}</span><time>{dateText(w.deadline_at)}</time></button>) : <p>此项目暂无等待中的延时任务。</p>}</section>
       {error && <p role="alert" className="recurring-error">{error}</p>}
     </>}</div>
@@ -41,7 +41,7 @@ function RecurringSelect({ label, value, options, disabled, onChange }: { label:
     disabled={disabled} open={open} onOpenChange={setOpen} onOpenIntent={() => undefined} onOpenIntentCancel={() => undefined} onChange={onChange} /></div>;
 }
 
-function RecurringEditor({ project, taskId, onSaved, onBack, onConversation, onDirty, onOpportunity }: { onOpportunity?: (id: string) => void; project: Project; taskId: string; onSaved: (id: string | null) => Promise<void>; onBack: () => void; onConversation: (id: string) => void; onDirty: (dirty: boolean) => void }) {
+function RecurringEditor({ project, taskId, onSaved, onBack, onConversation, onDirty, onOpportunity, onJudgment }: { onJudgment?: (id:string) => void; onOpportunity?: (id: string) => void; project: Project; taskId: string; onSaved: (id: string | null) => Promise<void>; onBack: () => void; onConversation: (id: string) => void; onDirty: (dirty: boolean) => void }) {
   const [saved, setSaved] = useState<RecurringTask | null>(null);
   const [runs, setRuns] = useState<RecurringRun[]>([]);
   const [options, setOptions] = useState<AgentOptions | null>(null);
@@ -76,12 +76,11 @@ function RecurringEditor({ project, taskId, onSaved, onBack, onConversation, onD
     return () => { disposed = true; window.clearInterval(timer); };
   }, [taskId, dirty, busy, loading, saved?.revision]);
   const field = <K extends keyof RecurringInput>(key: K, value: RecurringInput[K]) => setForm(f => ({ ...f, [key]: value }));
-  const scheduleField = <K extends keyof Recurrence>(key: K, value: Recurrence[K]) => setForm(f => ({ ...f, schedule: { ...f.schedule, [key]: value } }));
   async function save(state?: "active" | "paused") {
     setBusy(true); setError(""); setNotice("");
     try {
       const result = saved ? await api.updateRecurringTask(saved.id, { ...form, revision: saved.revision, state: state ?? (saved.state === "paused" ? "paused" : "active") }) : await api.createRecurringTask(project.id, form);
-      setSaved(result.task); setBaseline(JSON.stringify(form)); onDirty(false); setNotice("已保存"); await onSaved(result.task.id);
+      setSaved(result.task); const canonical = { ...form, schedule: result.task.schedule }; setForm(canonical); setBaseline(JSON.stringify(canonical)); onDirty(false); setNotice("已保存"); await onSaved(result.task.id);
     } catch (e) { setError(e instanceof Error ? e.message : "保存失败"); } finally { setBusy(false); }
   }
   async function toggleState() {
@@ -104,6 +103,7 @@ function RecurringEditor({ project, taskId, onSaved, onBack, onConversation, onD
   function retry() {
     if (!dirty || window.confirm("放弃尚未保存的修改并读取最新设置？")) void load();
   }
+  if(saved?.judgment) return <div className="recurring-editor"><button className="recurring-back" onClick={onBack}>← 全部定时任务</button><h2>{saved.name}</h2><p>这是判断簿的一次检查，事件期限和核验时间分别保留。请从判断详情调整日程、停止或重试。</p>{onJudgment?<button onClick={()=>onJudgment(saved.judgment!.id)}>打开判断：{saved.judgment.title}</button>:<p>在功能选择中开启判断簿即可管理；隐藏入口不取消计划。</p>}<p>{recurrenceLabel(saved.schedule)} · {saved.schedule.kind==='once'&&saved.state==='completed'?'已触发':recurringState(saved.state)}</p>{runs.map(r=><p key={r.id}>{dateText(r.scheduled_at)} · {r.status}{r.conversation_id&&<button onClick={()=>onConversation(r.conversation_id!)}>查看执行会话</button>}</p>)}</div>;
   return <div className="recurring-editor">
     <button className="recurring-back" onClick={onBack}>← 全部定时任务</button>
     {saved?.opportunityTopic && (onOpportunity ? <button onClick={() => onOpportunity(saved.opportunityTopic!.id)}>关联主题：{saved.opportunityTopic.name}</button> : <p>关联机会主题：{saved.opportunityTopic.name}。可在个人设置的功能选择中开启机会卡片入口；计划启停仍由本页管理。</p>)}
@@ -122,17 +122,16 @@ function RecurringEditor({ project, taskId, onSaved, onBack, onConversation, onD
         <section className="recurring-form-section" aria-labelledby="recurring-schedule-title">
           <div className="recurring-section-copy"><h3 id="recurring-schedule-title">重复安排</h3><p>按所选时区执行，每次到点都会新建会话。</p></div>
           <div className="recurring-grid">
-            <RecurringSelect label="重复方式" value={form.schedule.kind} options={[{ id: "daily", label: "每天" }, { id: "weekly", label: "每周" }, { id: "monthly", label: "每月" }, { id: "interval", label: "固定间隔" }]} disabled={disabled} onChange={value => scheduleField("kind", value as Recurrence["kind"])} />
-            <label>时区<input aria-label="时区" value={form.schedule.timeZone} onChange={e => scheduleField("timeZone", e.target.value)} placeholder="Asia/Shanghai" required /></label>
-            {form.schedule.kind === "interval" ? <label>间隔（分钟）<input aria-label="间隔（分钟）" type="number" min={1} max={525600} required value={form.schedule.intervalMinutes} onChange={e => scheduleField("intervalMinutes", Number(e.target.value))} /></label> : <label>执行时间<input aria-label="执行时间" type="time" required value={form.schedule.time} onChange={e => scheduleField("time", e.target.value)} /></label>}
-            {form.schedule.kind === "monthly" && <label>每月几号<input aria-label="每月几号" type="number" min={1} max={31} required value={form.schedule.monthDay} onChange={e => scheduleField("monthDay", Number(e.target.value))} /><small>没有该日期的月份会跳过。</small></label>}
+            <RecurringSelect label="重复方式" value={form.schedule.kind} options={[{ id: "daily", label: "每天" }, { id: "daily_times", label: "每天多次" }, { id: "daily_windows", label: "每日分时段" }, { id: "weekly", label: "每周" }, { id: "monthly", label: "每月" }, { id: "interval", label: "固定间隔" }]} disabled={disabled} onChange={value => field("schedule", changeRecurrenceKind(value as Recurrence["kind"], form.schedule))} />
+            <label>时区<input aria-label="时区" value={form.schedule.timeZone} onChange={e => field("schedule", { ...form.schedule, timeZone: e.target.value })} placeholder="Asia/Shanghai" required /></label>
             <div className="recurring-field"><RecurringSelect label="重复次数" value={form.maxRuns === null ? "unlimited" : "limited"} options={[{ id: "unlimited", label: "不限次数" }, { id: "limited", label: "指定总次数" }]} disabled={disabled} onChange={value => field("maxRuns", value === "unlimited" ? null : Math.max(1, (saved?.runCount ?? 0) + 10))} />{form.maxRuns !== null && <input aria-label="总执行次数" type="number" min={1} max={100000} required value={form.maxRuns} onChange={e => field("maxRuns", Number(e.target.value))} />}</div>
           </div>
-          {form.schedule.kind === "weekly" && <div className="recurring-weekdays" role="group" aria-label="每周执行日期">{[1,2,3,4,5,6,0].map(d => <label key={d}><input type="checkbox" checked={form.schedule.weekdays.includes(d)} onChange={e => scheduleField("weekdays", e.target.checked ? [...form.schedule.weekdays,d].sort() : form.schedule.weekdays.filter(v => v !== d))} />周{weekdays[d]}</label>)}</div>}
-          <details className="recurring-policy"><summary>执行规则</summary><p>上一轮仍在运行或等待时跳过本次；服务恢复后只补一次，不堆积历史轮次。停止某次会话不影响以后的日程。暂停或删除周期任务只停止未来触发。</p></details>
+          <RecurringScheduleFields schedule={form.schedule} onChange={value => field("schedule", value)} />
+          <IntradayPreview schedule={form.schedule} />
+          <details className="recurring-policy"><summary>执行规则</summary><p>上一轮仍在运行或等待时跳过本次；服务恢复后只补一次，不堆积历史轮次。停止某次会话不影响以后的日程。暂停或删除周期任务只停止未来触发。</p><p>这些是固定日程，不会根据任务结果自动改期。不同周期任务之间不互斥；设备或应用锁仍由各任务的既有流程检查，到点不保证资源空闲。</p></details>
         </section>
         <div className="recurring-form-footer">
-        {saved && <div className="recurring-summary"><span>下次执行<strong>{dateText(saved.nextRunAt, saved.schedule.timeZone)}</strong></span><span>已执行<strong>{saved.runCount}{saved.maxRuns === null ? " 次" : ` / ${saved.maxRuns} 次`}</strong></span></div>}
+        {saved && <div className="recurring-summary"><span>已保存的下次执行<strong>{dateText(saved.nextRunAt, saved.schedule.timeZone)}</strong></span><span>已执行<strong>{saved.runCount}{saved.maxRuns === null ? " 次" : ` / ${saved.maxRuns} 次`}</strong></span></div>}
         <div className="recurring-actions"><button className="primary-button" type="submit" disabled={busy}>{busy ? "保存中…" : saved ? "保存更改" : "创建周期任务"}</button>{saved && <><button type="button" onClick={() => void toggleState()}>{saved.state === "active" ? <Pause size={16} /> : <Play size={16} />}{saved.state === "active" ? "暂停任务" : "启用任务"}</button><button type="button" className="danger" onClick={() => void remove()}><Trash2 size={16} />删除</button></>}{dirty && <span className="recurring-save-status">有未保存的更改</span>}</div>
         </div>
       </fieldset>

@@ -41,12 +41,16 @@ const EXCEL_ATTACHMENT_RULES = [
   "- 尽量保留公式、样式和工作簿结构；保存后重新打开，核对工作表、关键数据、公式及错误。",
 ].join("\n");
 
+const WEB_DELIVERY_RULES = "HTML 交付展示类型：报告保持 reader；需要运行脚本的交互/演示网页必须是 5 MiB 以内的自包含 HTML，所有脚本、CSS、图片、字体与数据内嵌。将最终 HTML 及同名追加 .pp-agent.json 的声明文件一同写入 CWW_OUTPUTS_DIR（如 demo.html.pp-agent.json），JSON 为 {\"presentation_mode\":\"web\",\"sha256\":\"最终 HTML 的完整 SHA-256\"}。报告可同样声明 reader。HTML 中 pp-agent-view meta 仅为提示，不能代替声明；旧文件/仅标记文件仍按阅读器处理。平台完整回传校验后才登记，默认私有。音视频也必须以内嵌 data URL 提供；a/area 的 href 仅允许 #页内锚点，资料来源的外链放在最终聊天回复中，不放入交互 HTML。MP3 等独立成品直接作为附件交付，不在网页内做下载链接。首版无后端、登录、外部 API、外部资源、实时协作或 localStorage；状态仅在本次页面中。需要导出时，仅在用户点击中调用 window.ppAgent.exportFile(\"结果.json\", JSON.stringify(data))，支持 json/csv/txt、UTF-8 文本 1 MiB 以内，平台确认下载；不支持静默存储。用真实按钮验证交互后交付，不把限制内不可用的功能声称成功。声明文件是协议材料，不作为用户附件链接。";
+
 const SKILL_LOCATOR_RULES = [
+  WEB_DELIVERY_RULES,
   "技能读取规则：运行时提供的 Available skills 清单中的 source locator 是权威文件路径。使用某个技能时，必须按清单给出的完整路径读取其 SKILL.md，并按该文件中的相对路径读取 references、assets 和 scripts。",
   "不要把账号级技能改写到 .system/<skill-name>、不要只在项目根的 .agents/skills 中查找，也不要因为项目目录里没有该文件就判断技能缺失；账号级技能通常位于当前 CODEX_HOME/skills/<skill-name>/。",
 ].join("\n");
 
 type TurnPromptOptions = {
+  managedWebDelivery?: boolean;
   userPrompt: string;
   attachments: AgentAttachmentContext[];
   personalContext?: string;
@@ -77,7 +81,9 @@ export function buildAgentTurnPrompt(options: TurnPromptOptions): string {
   }
   if (options.capabilityRoutingHint) parts.push(options.capabilityRoutingHint);
   if (options.personalContext?.trim()) parts.push(options.personalContext.trim());
+  if (/判断簿|预测簿|judgment/i.test(instruction)) parts.push('判断簿使用 codex_web_judgments 工具，先 context / list / detail。旧会话未发现时将相同 JSON 写入过程文件，再运行 node "$CODEX_WEB_JUDGMENT_CLI" 请求文件；使用环境凭据，不读取、打印或复制。本人概率须来自本人，语义候选必须由本人在页面确认；缺少证据不能判否。');
   if (/机会|opportunit/i.test(instruction)) parts.push('机会主题在服务器项目的正常会话中管理：使用 codex_web_opportunities（先 topics / context）。旧会话未发现该工具时，可将同样的 JSON 请求写入过程文件，再运行 node "$CODEX_WEB_OPPORTUNITY_CLI" 请求文件；凭据由运行环境提供，不读取、打印或复制。远程项目不可操作机会主题。');
+  if (options.managedWebDelivery) parts.push(WEB_DELIVERY_RULES);
   parts.push(instruction);
   return parts.join("\n\n");
 }

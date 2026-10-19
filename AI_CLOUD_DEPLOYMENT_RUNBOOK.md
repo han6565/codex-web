@@ -767,3 +767,7 @@ Codex Web 部署结果
 ## Opportunity cards increment
 
 Use the normal build and upgrade path; back up the deployment's own state first. No extra environment settings, cloud credentials or services are required for navigation, counts and feedback-learning bookkeeping. Optional voice needs the operator's own provider configuration. Topic knowledge is an optional project-relative Markdown entry. Review [migration details](docs/OPPORTUNITY_CARDS.md#upgrade-and-migration), then verify login, ownership and SQLite integrity. No topics or schedules are enabled automatically.
+
+## Feature upgrades
+
+Apply the [upgrade checklist](docs/UPGRADE_20261020.md) after saving an operator-controlled backup. Interactive artifacts, optional judgments and background voice feedback use the existing database and persistent volumes; no additional host npm installation, dependency set or default service is required. Keep optional providers empty until explicitly configured.

@@ -1,3 +1,5 @@
+import sharp from 'sharp';
+import { OpportunityImages } from '../server/opportunity-images.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -18,7 +20,9 @@ const content=(n:number)=>contentInput.parse({title:'候选 '+n,summary:'第 '+n
 function fixture(t:test.TestContext){const root=fs.mkdtempSync(path.join(os.tmpdir(),'opportunity-')),db=new AppDatabase(root),s=new OpportunityStore(db),p=db.createProject(id(),u,'Server',root,'tenant-local'),c=db.createConversation(id(),'Discovery',selection,u,p.id),topic=s.createTopic(u,{name:'验收主题',project_id:p.id,goal:'探索不同创作游戏'},id());t.after(()=>{db.close();fs.rmSync(root,{recursive:true,force:true});});return {root,db,s,p,c,topic};}
 function reviewAll(s:OpportunityStore,topicId:string,bid:string,cid:string){const pool=s.context(u,topicId).inventory;return s.review(u,bid,cid,pool.map((v,i)=>({idea_id:v.id,verdict:'approve',score:90-i/100,quality:85,rationale:'证据、投入和独立可验证性通过；根据当前偏好重排',compared:s.neighbors(u,v.content,v.id).map(n=>({id:n.id,difference:'编号代表具体不同的试验问题与核心机制，仅共享受众'}))})));}
 function learn(s:OpportunityStore,tid:string,cid:string){let page=s.feedbackInbox(u,tid);while(page.pending){s.learnFeedback(u,tid,cid,{requestKey:id(),after:page.watermark,through:page.through,feedbackRevision:page.feedbackRevision,summary:'测试逐页归纳：保留原始反馈，暂未推断通用偏好',principles:[]});page=s.feedbackInbox(u,tid);}}
-function publish(s:OpportunityStore,tid:string,bid:string,cid:string,ids:string[]){return s.publish(u,bid,cid,{ids,summary:'以适配与玩法组合多样性选取，其余合格项继续保留',feedbackRevision:s.feedbackRevision(u,tid)});}
+// These inventory tests exercise ranking, not media validation; seed explicit metadata.
+function seedImage(s:OpportunityStore,ideaId:string,cid:string){if(!s.images(u,ideaId).length)s.sql.prepare('INSERT INTO opportunity_images VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(id(),ideaId,u,cid,'outputs/fixture.png','image/png',1,'fixture',1,1,'测试图','',0,new Date().toISOString());}
+function publish(s:OpportunityStore,tid:string,bid:string,cid:string,ids:string[]){ids.forEach(i=>seedImage(s,i,cid));return s.publish(u,bid,cid,{ids,summary:'以适配与玩法组合多样性选取，其余合格项继续保留',feedbackRevision:s.feedbackRevision(u,tid)});}
 test('multi-day inventory: 10 -> 3+7; new 10 -> 17 -> 3+14; zero new still selects stable old identities',t=>{const {s,c,topic}=fixture(t);const b1=s.begin(u,topic.id,c.id,null,day);const first=s.ingest(u,b1.id,c.id,Array.from({length:10},(_,i)=>({key:'d1-'+i,content:content(i)})));reviewAll(s,topic.id,b1.id,c.id);publish(s,topic.id,b1.id,c.id,first.slice(0,3).map(v=>v.idea.id));assert.equal(s.context(u,topic.id).inventory.length,7);assert.equal(s.history(u).total,10);
  const c2=s.db.createConversation(id(),'Next day',selection,u,c.project_id!),b2=s.begin(u,topic.id,c2.id,null,day+86400000);s.ingest(u,b2.id,c2.id,Array.from({length:10},(_,i)=>({key:'d2-'+i,content:content(i+10)})));assert.equal(s.context(u,topic.id).inventory.length,17);assert.throws(()=>publish(s,topic.id,b2.id,c2.id,[first[3].idea.id]),/尚未参与/);reviewAll(s,topic.id,b2.id,c2.id);publish(s,topic.id,b2.id,c2.id,first.slice(3,6).map(v=>v.idea.id));assert.equal(s.context(u,topic.id).inventory.length,14);assert.ok(s.idea(u,first[3].idea.id).first_recommended_at);assert.equal(s.idea(u,first[3].idea.id).source_batch_id,b1.id);assert.equal(s.idea(u,first[3].idea.id).recommended_batch_id,b2.id);
  assert.equal(s.begin(u,topic.id,c2.id,null,day+86400000).id,b2.id);const retried=publish(s,topic.id,b2.id,c2.id,first.slice(3,6).map(v=>v.idea.id));assert.equal(retried.idempotent,true);assert.equal(s.history(u).total,20);
@@ -48,8 +52,37 @@ test('failed jobs release batch, finite attempts, cross-account ownership and sc
  const other=id();assert.throws(()=>s.topic(other,topic.id),/不存在/);assert.throws(()=>s.batch(other,b.id),/不存在/);assert.throws(()=>s.serverProject(other,p.id),/不存在/);assert.throws(()=>s.setPreference(u,topic.id,{text:'全局推断',kind:'inferred',scope:'account',source:'topic-goal'},true),/当前主题/);const pref=s.setPreference(u,topic.id,{text:'偏好创作',kind:'explicit',source:'用户设置'})[0];s.setPreference(u,topic.id,{...pref,active:false});assert.equal(s.preferences(u,topic.id).length,0);assert.equal(s.preferences(u,topic.id,true).length,1);assert.throws(()=>s.recent(u,topic.id),/尚未授权/);
 });
 test('optional feature is independent, defaults false, and old clients cannot clear opted-in flag',t=>{const {db}=fixture(t);db.sqlite.prepare("INSERT INTO user_settings(user_id,key,value,updated_at) VALUES(?,'feature_selection',?,'now')").run(u,JSON.stringify({paraBoard:true,revision:7}));assert.deepEqual(db.getFeatureSelection(u),{paraBoard:true,opportunityCards:false,revision:7});db.setFeatureSelection(u,{paraBoard:true,opportunityCards:true,revision:7});db.setFeatureSelection(u,{paraBoard:false,revision:8});assert.deepEqual(db.getFeatureSelection(u),{paraBoard:false,opportunityCards:true,revision:9});});
-test('research and project promotion use normal conversations and stable links without automatic validation',t=>{const {s,c,topic,db}=fixture(t),b=s.begin(u,topic.id,c.id,null,day),idea=s.ingest(u,b.id,c.id,[{key:'research',content:content(1)}])[0].idea;const k=id(),started=s.start(u,topic.id,selection,k,idea.id);assert.equal(s.start(u,topic.id,selection,k,idea.id).conversationId,started.conversationId);assert.equal(db.listPendingPrompts(started.conversationId).length,1);assert.equal(s.detail(u,idea.id).research[0].status,'interested');s.researchResult(u,idea.id,started.conversationId,{status:'inconclusive',result:'资料支持可实现，儿童体验还需实测'});assert.equal(s.detail(u,idea.id).research[0].status,'inconclusive');const para=new ParaStore(db),board=para.createBoard(u,'机会实验',null),promoted=s.toProject(u,idea.id,board.id,id());assert.equal(s.toProject(u,idea.id,board.id,id()).id,promoted.id);assert.equal(s.idea(u,idea.id).state,'project');assert.equal(promoted.stage,'idea');});
-test('real routes enforce CSRF, ownership, server executor, live job credential and no feature-driven background creation',async t=>{const root=fs.mkdtempSync(path.join(os.tmpdir(),'opportunity-api-')),password='fixture-password',secret='opportunity-test-secret-at-least-32-characters';const app=createApp({projectRoot:process.cwd(),dataRoot:path.join(root,'data'),tenantRoot:path.join(root,'tenants'),queueAutoStart:false,username:'owner',passwordHash:bcrypt.hashSync(password,4),sessionSecret:secret,minimumFreeDiskBytes:0});t.after(()=>{app.beginShutdown();app.db.close();fs.rmSync(root,{recursive:true,force:true});});const a=request.agent(app.app),login=await a.post('/api/auth/login').send({username:'owner',password}).expect(200),csrf=login.body.csrfToken,p=app.db.createProject(id(),u,'API Server',root,'tenant-local');const body={requestKey:id(),name:'API topic',project_id:p.id,goal:'探索'};await a.post('/api/opportunities/topics').send(body).expect(403);const created=await a.post('/api/opportunities/topics').set('X-CSRF-Token',csrf).send(body).expect(201);const tid=created.body.topic.id;
+test('research and project promotion use normal conversations and stable links without automatic validation',t=>{const {s,c,topic,db}=fixture(t),b=s.begin(u,topic.id,c.id,null,day),idea=s.ingest(u,b.id,c.id,[{key:'research',content:content(1)}])[0].idea;const k=id(),started=s.start(u,topic.id,selection,k,idea.id);assert.equal(s.start(u,topic.id,selection,k,idea.id).conversationId,started.conversationId);assert.equal(db.listPendingPrompts(started.conversationId).length,0);assert.ok(db.getComposerDraft(started.conversationId)?.content.includes(idea.id));assert.equal(s.detail(u,idea.id).research[0].status,'interested');s.researchResult(u,idea.id,started.conversationId,{status:'inconclusive',result:'资料支持可实现，儿童体验还需实测'});assert.equal(s.detail(u,idea.id).research[0].status,'inconclusive');const para=new ParaStore(db),board=para.createBoard(u,'机会实验',null),promoted=s.toProject(u,idea.id,board.id,id());assert.equal(s.toProject(u,idea.id,board.id,id()).id,promoted.id);assert.equal(s.idea(u,idea.id).state,'project');assert.equal(promoted.stage,'idea');});
+test('research drafts preserve feedback, unsaved ideas and edits without enqueueing work',t=>{
+ const {s,c,topic,db,p}=fixture(t),b=s.begin(u,topic.id,c.id,null,day);
+ const ideas=s.ingest(u,b.id,c.id,[{key:'draft',content:content(21)},{key:'unrelated',content:content(22)}]);
+ const original=ideas[0].idea;
+ const first=s.feedback(u,original.id,{requestKey:id(),revision:original.revision,action:'rate',rating:4,note:'先验证自由绘画\n再尝试角色试戴'});
+ const second=s.feedback(u,original.id,{requestKey:id(),revision:first.revision,action:'rate',rating:2,note:'已撤销的方向'});
+ const current=s.feedback(u,original.id,{requestKey:id(),revision:second.revision,action:'undo'});
+ s.feedback(u,ideas[1].idea.id,{requestKey:id(),revision:ideas[1].idea.revision,action:'rate',note:'OTHER_CARD_PRIVATE_NOTE'});
+ const key=id(),draftFeedback={rating:5,note:'本次补充：保留原始笔触\n先做最小原型'};
+ const started=s.start(u,topic.id,selection,key,original.id,draftFeedback),cid=started.conversationId;
+ const draft=db.getComposerDraft(cid)!;
+ assert.equal(db.getConversation(cid)?.project_id,p.id);
+ assert.match(draft.content,/评分：4 星/);assert.match(draft.content,/先验证自由绘画\n再尝试角色试戴/);
+ assert.ok(draft.content.includes(draftFeedback.note));assert.match(draft.content,/尚未保存到卡片/);
+ assert.match(draft.content,/撤销上次/);assert.match(draft.content,/不作为当前要求/);
+ assert.ok(!draft.content.includes('OTHER_CARD_PRIVATE_NOTE'));
+ assert.equal(s.idea(u,original.id).rating,current.rating);assert.equal(s.idea(u,original.id).note,current.note);
+ assert.equal(s.detail(u,original.id).feedback.length,3);
+ for(const table of ['pending_prompts','messages','jobs'])assert.equal(db.sqlite.prepare(`SELECT count(*) n FROM ${table} WHERE conversation_id=?`).get(cid)?.n,0);
+ db.saveComposerDraft(cid,draft.content+'\n我手动补充的内容',null);
+ assert.equal(s.start(u,topic.id,selection,key,original.id,draftFeedback).conversationId,cid);
+ assert.ok(db.getComposerDraft(cid)?.content.endsWith('我手动补充的内容'));
+ assert.equal(s.detail(u,original.id).research.length,1);
+ const before=db.sqlite.prepare('SELECT count(*) n FROM conversations').get()?.n;
+ assert.throws(()=>s.start(u,topic.id,selection,id(),original.id,{rating:6,note:'bad'}));
+ assert.throws(()=>s.start(u,topic.id,selection,id(),original.id,{rating:null,note:'x'.repeat(6001)}));
+ assert.equal(db.sqlite.prepare('SELECT count(*) n FROM conversations').get()?.n,before);
+});
+
+test('real routes enforce CSRF, ownership, server executor, live job credential and no feature-driven background creation',async t=>{const root=fs.mkdtempSync(path.join(os.tmpdir(),'opportunity-api-')),password='fixture-password',secret='opportunity-test-secret-at-least-32-characters';const app=createApp({projectRoot:process.cwd(),dataRoot:path.join(root,'data'),tenantRoot:path.join(root,'tenants'),queueAutoStart:false,username:'pp',passwordHash:bcrypt.hashSync(password,4),sessionSecret:secret,minimumFreeDiskBytes:0});t.after(()=>{app.beginShutdown();app.db.close();fs.rmSync(root,{recursive:true,force:true});});const a=request.agent(app.app),login=await a.post('/api/auth/login').send({username:'pp',password}).expect(200),csrf=login.body.csrfToken,p=app.db.createProject(id(),u,'API Server',root,'tenant-local');const body={requestKey:id(),name:'API topic',project_id:p.id,goal:'探索'};await a.post('/api/opportunities/topics').send(body).expect(403);const created=await a.post('/api/opportunities/topics').set('X-CSRF-Token',csrf).send(body).expect(201);const tid=created.body.topic.id;
  assert.equal(new RecurringStore(app.db).list(u).length,0);await a.put('/api/user-settings/features').set('X-CSRF-Token',csrf).send({paraBoard:false,opportunityCards:true,revision:0}).expect(200);assert.equal(new RecurringStore(app.db).list(u).length,0);
  const other=id(),now=new Date().toISOString();app.db.createUser({id:other,username:'other',display_name:'Other',password_hash:bcrypt.hashSync(password,4),role:'member',status:'active',created_at:now,updated_at:now});const friend=request.agent(app.app),fl=await friend.post('/api/auth/login').send({username:'other',password}).expect(200);await friend.get('/api/opportunities/topics/'+tid).expect(404);await friend.patch('/api/opportunities/topics/'+tid).set('X-CSRF-Token',fl.body.csrfToken).send({...body,revision:1}).expect(404);assert.equal((await friend.get('/api/opportunities')).body.topics.length,0);
  await request(app.app).get('/api/opportunities/topics').expect(401);
@@ -69,7 +102,38 @@ test('real routes enforce CSRF, ownership, server executor, live job credential 
  const c=app.db.createConversation(id(),'Agent',selection,u,p.id),j=app.db.createJob(id(),c.id,undefined,selection);app.db.sqlite.prepare("UPDATE jobs SET status='running' WHERE id=?").run(j.id);const token=createJobAutomationToken(secret,j.id,c.id);await request(app.app).post(`/api/automation/jobs/${j.id}/opportunities`).set('Authorization','Bearer '+token).send({action:'context',topicId:tid}).expect(200);
  const store=new OpportunityStore(app.db),batch=store.begin(u,tid,c.id,j.id),idea=store.ingest(u,batch.id,c.id,[{key:'route',content:content(9)}])[0].idea;
  const corrected=await request(app.app).post(`/api/automation/jobs/${j.id}/opportunities`).set('Authorization','Bearer '+token).send({action:'evidence',topicId:tid,data:{ideaId:idea.id,requestKey:id(),revision:idea.revision,reason:'实际受控接口更正',patch:{facts:'有来源支持的更正事实'}}}).expect(200);assert.equal(corrected.body.idea.content.facts,'有来源支持的更正事实');
+ const imageDir=path.join(root,'tenants',u,'conversations',c.id,'outputs');fs.mkdirSync(imageDir,{recursive:true});
+ const imageBytes=await sharp({create:{width:32,height:24,channels:3,background:'#ffeedd'}}).png().toBuffer();fs.writeFileSync(path.join(imageDir,'concept.png'),imageBytes);
+ const imageBody={action:'images',topicId:tid,data:{ideaId:idea.id,requestKey:id(),revision:corrected.body.idea.revision,images:[{path:'outputs/concept.png',alt:'概念图'}]}};
+ const imageRoute=`/api/automation/jobs/${j.id}/opportunities`;
+ await request(app.app).post(imageRoute).send(imageBody).expect(401);
+ const attached=await request(app.app).post(imageRoute).set('Authorization','Bearer '+token).send(imageBody).expect(200);
+ assert.equal(attached.body.idea.images.length,1);const mediaUrl=attached.body.idea.images[0].url;
+ assert.deepEqual((await request(app.app).post(imageRoute).set('Authorization','Bearer '+token).send(imageBody).expect(200)).body,attached.body);
+ await request(app.app).get(mediaUrl).expect(401);await friend.get(mediaUrl).expect(404);
+ const imageResult=await a.get(mediaUrl).expect(200);assert.deepEqual(imageResult.body,imageBytes);assert.equal(imageResult.headers['content-type'],'image/png');
+ await a.post(mediaUrl+'/activate').send({}).expect(403);await friend.post(mediaUrl+'/activate').set('X-CSRF-Token',fl.body.csrfToken).send({}).expect(404);
+ await a.post(mediaUrl+'/activate').set('X-CSRF-Token',csrf).send({}).expect(200);
+ app.db.sqlite.prepare("UPDATE conversation_storage SET state='cold' WHERE conversation_id=?").run(c.id);
+ const activity=app.db.getConversation(c.id)!.last_active_at;
+ assert.equal((await a.get(mediaUrl+'/status').expect(200)).body.state,'cold');await a.get(mediaUrl).expect(409);
+ assert.equal(app.db.getConversation(c.id)!.last_active_at,activity);
+ app.db.sqlite.prepare("UPDATE conversation_storage SET state='local' WHERE conversation_id=?").run(c.id);
+ await a.get(mediaUrl).expect(200);
  const rated=store.idea(u,idea.id);store.feedback(u,idea.id,{requestKey:id(),revision:rated.revision,action:'rate',rating:5,note:'优先容易验证的方案'});
+ const researchUrl=`/api/opportunities/ideas/${idea.id}/research`,researchBody={requestKey:id(),draftFeedback:{rating:4,note:'验证具体实现步骤'}};
+ await a.post(researchUrl).send(researchBody).expect(403);
+ await friend.post(researchUrl).set('X-CSRF-Token',fl.body.csrfToken).send(researchBody).expect(404);
+ await a.post(researchUrl).set('X-CSRF-Token',csrf).send({...researchBody,draftFeedback:{rating:9,note:'invalid'}}).expect(400);
+ const research=await a.post(researchUrl).set('X-CSRF-Token',csrf).send(researchBody).expect(201);
+ const draftCid=research.body.conversationId;
+ const detail=(await a.get(`/api/conversations/${draftCid}`).expect(200)).body;
+ assert.match(detail.composerDraft.content,/优先容易验证的方案/);assert.match(detail.composerDraft.content,/验证具体实现步骤/);
+ assert.equal(app.db.listPendingPrompts(draftCid).length,0);
+ assert.equal(app.db.sqlite.prepare('SELECT count(*) n FROM jobs WHERE conversation_id=?').get(draftCid)?.n,0);
+ await a.put(`/api/conversations/${draftCid}/draft`).set('X-CSRF-Token',csrf).send({content:'用户调整后的研究指令',quoteExcerpt:null}).expect(200);
+ const retry=await a.post(researchUrl).set('X-CSRF-Token',csrf).send(researchBody).expect(201);
+ assert.equal(retry.body.conversationId,draftCid);assert.equal(app.db.getComposerDraft(draftCid)?.content,'用户调整后的研究指令');
  const inbox=await request(app.app).post(`/api/automation/jobs/${j.id}/opportunities`).set('Authorization','Bearer '+token).send({action:'feedback_inbox',topicId:tid}).expect(200);assert.equal(inbox.body.pending,1);
  await request(app.app).post(`/api/automation/jobs/${j.id}/opportunities`).set('Authorization','Bearer '+token).send({action:'learn_feedback',topicId:tid,data:{requestKey:id(),after:inbox.body.watermark,through:inbox.body.through,feedbackRevision:inbox.body.feedbackRevision,summary:'明确反馈凝练验证原则',principles:[{text:'优先容易验证的方案',kind:'explicit',source:inbox.body.items[0].id}]}}).expect(200);assert.equal(store.feedbackLearning(u,tid).pending,0);assert.equal(store.preferences(u,tid)[0].text,'优先容易验证的方案');
  const otherTopic=store.createTopic(u,{name:'Other topic',project_id:p.id,goal:'different scope'},id());await request(app.app).post(`/api/automation/jobs/${j.id}/opportunities`).set('Authorization','Bearer '+token).send({action:'evidence',topicId:otherTopic.id,data:{ideaId:idea.id}}).expect(403);
@@ -235,3 +299,25 @@ test('project knowledge is the single principle source and learning records writ
  assert.deepEqual(JSON.parse(String(s.sql.prepare('SELECT knowledge_files_json FROM opportunity_feedback_learning').get()?.knowledge_files_json)),[file]);
  assert.equal(s.preferences(u,topic.id,true).length,1);assert.match(fs.readFileSync(path.join(root,file),'utf8'),/可观察|观察验证/);
 });
+
+ test('explanatory images gate publication; validate bytes, paths, ownership, revisions and deleted sources',async t=>{
+ const {s,c,topic,db,root,p}=fixture(t),tenantRoot=path.join(root,'tenants'),media=new OpportunityImages(db,tenantRoot),b=s.begin(u,topic.id,c.id,null,day);
+ const idea=s.ingest(u,b.id,c.id,[{key:'visual',content:content(999)}])[0].idea;reviewAll(s,topic.id,b.id,c.id);
+ assert.throws(()=>s.publish(u,b.id,c.id,{ids:[idea.id],summary:'配图检查',feedbackRevision:s.feedbackRevision(u,topic.id)}),/说明图片/);
+ const dir=path.join(tenantRoot,u,'conversations',c.id,'outputs');fs.mkdirSync(dir,{recursive:true});
+ const bytes=await sharp({create:{width:80,height:60,channels:3,background:'#aabbcc'}}).webp().toBuffer();fs.writeFileSync(path.join(dir,'concept.webp'),bytes);
+ const body=()=>({ideaId:idea.id,requestKey:id(),revision:s.idea(u,idea.id).revision,images:[{path:'outputs/concept.webp',alt:'一眼看懂核心流程',caption:'图示仅为方案示例'}]});
+ for(const name of ['../secret','outputs/../secret','/etc/passwd','outputs//x','outputs/x\\y']) await assert.rejects(()=>media.attach(u,c.id,undefined,{...body(),images:[{path:name,alt:'越界'}]}));
+ fs.symlinkSync(path.join(dir,'concept.webp'),path.join(dir,'link.webp'));await assert.rejects(()=>media.attach(u,c.id,undefined,{...body(),images:[{path:'outputs/link.webp',alt:'链接'}]}));
+ fs.symlinkSync(dir,path.join(dir,'linked-dir'));await assert.rejects(()=>media.attach(u,c.id,undefined,{...body(),images:[{path:'outputs/linked-dir/concept.webp',alt:'目录链接'}]}),/符号链接/);
+ fs.linkSync(path.join(dir,'concept.webp'),path.join(dir,'hardlink.webp'));await assert.rejects(()=>media.attach(u,c.id,undefined,body()),/普通图片/);fs.unlinkSync(path.join(dir,'hardlink.webp'));
+ fs.writeFileSync(path.join(dir,'fake.png'),'not an image');await assert.rejects(()=>media.attach(u,c.id,undefined,{...body(),images:[{path:'outputs/fake.png',alt:'伪造图片'}]}));
+ const wrongProject=db.createProject(id(),u,'Other',path.join(root,'other'),'tenant-local'),wrong=db.createConversation(id(),'Wrong',selection,u,wrongProject.id);await assert.rejects(()=>media.attach(u,wrong.id,undefined,body()),/关联的服务器项目/);
+ const payload=body(),result=await media.attach(u,c.id,undefined,payload);assert.equal(result.idea.images.length,1);assert.deepEqual(await media.attach(u,c.id,undefined,payload),result);
+ await assert.rejects(()=>media.attach(u,c.id,undefined,{...payload,requestKey:id()}),/卡片已变化/);
+ const image=s.idea(u,idea.id).images![0];assert.equal(image.state,'local');assert.deepEqual((await media.bytes(u,idea.id,image.id)).bytes,bytes);
+ s.publish(u,b.id,c.id,{ids:[idea.id],summary:'已验证配图',feedbackRevision:s.feedbackRevision(u,topic.id)});
+ fs.writeFileSync(path.join(dir,'concept.webp'),Buffer.from('changed'));await assert.rejects(()=>media.bytes(u,idea.id,image.id),/已变化/);fs.writeFileSync(path.join(dir,'concept.webp'),bytes);
+ db.sqlite.prepare('DELETE FROM conversations WHERE id=?').run(c.id);assert.equal(s.idea(u,idea.id).images![0].state,'unavailable');await assert.rejects(()=>media.bytes(u,idea.id,image.id),/不可用/);
+ assert.deepEqual(db.sqlite.prepare('pragma foreign_key_check').all(),[]);
+ });

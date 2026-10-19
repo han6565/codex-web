@@ -345,3 +345,7 @@ Username/password login, `/codex-web`, isolated tenant workers and empty optiona
 - Recurring tasks and conversations load together; compact schedule forms retain model/effort choices and format long intervals clearly. Default conversation titles retry on a later user message without overwriting a manual title.
 - [Bounded writer shutdown](docs/APP_SERVER_SHUTDOWN.md) waits for the actual process group to exit; shared account token refresh can safely commit from an isolated tenant.
 - Remote Worker **1.20.2** raises automatic result delivery to **256 files**, retaining the 2 GiB per-file, 8 GiB per-batch and 30-minute transfer limits. Existing node transfer UI/skills remain available only with configured capabilities.
+
+## Recent capabilities
+
+Managed interactive HTML attachments run in an isolated sandbox, with explicit user export and versioned, private-by-default sharing. Optional [judgment books](docs/JUDGMENT_BOOK.md) preserve your probabilities, evidence and confirmations. Project schedules support daily time windows and one-time checks; new conversations may use a saved per-account model choice. Opportunity voice feedback continues and saves after upload. Project menus can acknowledge current unread results. [Transient routing recovery](docs/UPSTREAM_RETRY.md) and SQLite-safe finalization preserve committed work. See [upgrade notes](docs/UPGRADE_20261020.md).

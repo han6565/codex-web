@@ -100,7 +100,7 @@ test("repository shared account resource contains the enabled HTML report Skill"
   const template = fs.readFileSync(path.join(skillRoot, "assets", "report-template.html"), "utf8");
   const validator = fs.readFileSync(path.join(skillRoot, "scripts", "validate_report.py"), "utf8");
   assert.match(skill, /^---\nname: html-report\n/);
-  assert.match(skill, /single self-contained UTF-8 HTML file/);
+  assert.match(skill, /one self-contained UTF-8 HTML file/);
   assert.match(skill, /flat, solid-color visual system/);
   assert.match(styleGuide, /Use only solid color fills/);
   assert.doesNotMatch(template, /gradient\s*\(/i);

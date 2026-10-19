@@ -4,7 +4,8 @@ import path from "node:path";
 import type { Request, Response } from "express";
 import type { AppConfig } from "./config.js";
 import { AppDatabase, StorageQuotaExceededError, type FileRow, type ResumableUploadRow, type SessionRow } from "./db.js";
-import { ensureTenantWorkspace, newId, safeUploadName } from "./paths.js";
+import { newId, safeUploadName, tenantPaths } from "./paths.js";
+import { grantCompletedUploadAccess, openUploadDirectory, uploadBasename } from "./upload-permissions.js";
 
 const TUS_VERSION = "1.0.0";
 const ACTIVE_STATES = new Set(["uploading", "finalizing"]);
@@ -49,10 +50,10 @@ function metadataHeader(upload: Pick<ResumableUploadRow, "original_name" | "mime
   ].map(([key, value]) => `${key} ${Buffer.from(value).toString("base64")}`).join(",");
 }
 
-async function sha256File(filePath: string): Promise<string> {
+async function sha256File(file: fs.promises.FileHandle): Promise<string> {
   const hash = crypto.createHash("sha256");
   await new Promise<void>((resolve, reject) => {
-    const stream = fs.createReadStream(filePath);
+    const stream = file.createReadStream({ start: 0, autoClose: false });
     stream.on("data", (chunk) => hash.update(chunk));
     stream.on("error", reject);
     stream.on("end", resolve);
@@ -68,6 +69,7 @@ export class ResumableUploadService {
   private readonly availableDiskBytes: ServiceOptions["availableDiskBytes"];
   private readonly maximumStoredBytesForUser: ServiceOptions["maximumStoredBytesForUser"];
   private readonly locks = new Set<string>();
+  private readonly finalizations = new Map<string, Promise<ResumableUploadRow>>();
   private cleanupTimer: NodeJS.Timeout | undefined;
 
   constructor(options: ServiceOptions) {
@@ -98,14 +100,14 @@ export class ResumableUploadService {
   }
 
   private partialPath(upload: Pick<ResumableUploadRow, "storage_name">): string {
-    const current = path.join(this.root, upload.storage_name);
-    const legacy = path.join(this.legacyRoot, upload.storage_name);
+    const current = path.join(this.root, uploadBasename(upload.storage_name));
+    const legacy = path.join(this.legacyRoot, uploadBasename(upload.storage_name));
     if (fs.existsSync(current) || !fs.existsSync(legacy)) return current;
     return legacy;
   }
 
   private partialPaths(upload: Pick<ResumableUploadRow, "storage_name">): string[] {
-    return [...new Set([path.join(this.root, upload.storage_name), path.join(this.legacyRoot, upload.storage_name)])];
+    return [...new Set([path.join(this.root, uploadBasename(upload.storage_name)), path.join(this.legacyRoot, uploadBasename(upload.storage_name))])];
   }
 
   private async removePartials(upload: Pick<ResumableUploadRow, "storage_name">): Promise<void> {
@@ -113,7 +115,8 @@ export class ResumableUploadService {
   }
 
   private finalPath(upload: Pick<ResumableUploadRow, "user_id" | "conversation_id" | "final_name">): string {
-    return path.join(ensureTenantWorkspace(this.config.tenantRoot, upload.user_id, upload.conversation_id), "uploads", upload.final_name);
+    if (!/^[0-9a-f-]{36}$/i.test(upload.conversation_id)) throw new Error("Invalid conversation id");
+    return path.join(tenantPaths(this.config.tenantRoot, upload.user_id).conversations, upload.conversation_id, "uploads", uploadBasename(upload.final_name));
   }
 
   private expiresAt(): string {
@@ -121,7 +124,7 @@ export class ResumableUploadService {
   }
 
   private isLocked(id: string): boolean {
-    return this.locks.has(id) || this.locks.has(`${id}:finalize`);
+    return this.locks.has(id) || this.finalizations.has(id);
   }
 
   private applyTusHeaders(res: Response, upload?: ResumableUploadRow): void {
@@ -313,51 +316,99 @@ export class ResumableUploadService {
 
   private async finalize(upload: ResumableUploadRow): Promise<ResumableUploadRow> {
     if (upload.state === "completed") return upload;
-    if (this.locks.has(`${upload.id}:finalize`)) return this.db.getResumableUpload(upload.id) ?? upload;
-    this.locks.add(`${upload.id}:finalize`);
+    const pending = this.finalizations.get(upload.id);
+    if (pending) return pending;
+    const completion = this.finalizeUpload(upload);
+    this.finalizations.set(upload.id, completion);
+    try { return await completion; }
+    finally { this.finalizations.delete(upload.id); }
+  }
+
+  private async finalizeUpload(upload: ResumableUploadRow): Promise<ResumableUploadRow> {
+    const assertOwner = (): void => {
+      if (!this.db.getConversationForUser(upload.conversation_id, upload.user_id)) throw new Error("Upload conversation ownership mismatch");
+    };
+    assertOwner();
+    // Validate stored names before any filesystem operation, including recovery.
+    this.finalPath(upload);
+    uploadBasename(upload.storage_name);
+    const directory = await openUploadDirectory(this.config.tenantRoot, [upload.user_id, "conversations", upload.conversation_id, "uploads"]);
+    const finalPath = `/proc/self/fd/${directory.fd}/${upload.final_name}`;
+    let file: fs.promises.FileHandle | undefined;
     try {
-      const partialPath = this.partialPath(upload);
-      const finalPath = this.finalPath(upload);
-      const finalStat = await fs.promises.stat(finalPath).catch(() => null);
+      const finalStat = await fs.promises.lstat(finalPath).catch((error: NodeJS.ErrnoException) => {
+        if (error.code === "ENOENT") return null;
+        throw error;
+      });
       if (!finalStat) {
-        const partialStat = await fs.promises.stat(partialPath);
-        if (partialStat.size !== upload.size) throw new Error("Upload is not complete");
+        const partialPath = this.partialPath(upload);
+        const partialStat = await fs.promises.lstat(partialPath);
+        if (!partialStat.isFile() || partialStat.nlink !== 1 || partialStat.size !== upload.size) throw new Error("Upload is not complete or is unsafe");
         upload = this.db.markResumableUploadFinalizing(upload.id, partialStat.size) ?? upload;
         try {
           await fs.promises.rename(partialPath, finalPath);
         } catch (error) {
           if (!(error instanceof Error) || (error as NodeJS.ErrnoException).code !== "EXDEV") throw error;
-          // Transitional recovery for sessions created in the old dataRoot.
-          // New uploads never take this path. Keep the destination invisible
-          // until a fully copied and fsynced temporary file is atomically moved.
           if (this.availableDiskBytes(true) - upload.size < this.config.minimumFreeDiskBytes) throw new Error("DISK_WATERMARK_FINALIZE");
+          // Copy through an exclusively created private inode. copyFile would
+          // inherit source permissions only after creating the destination.
           const temporaryPath = `${finalPath}.${upload.id}.tus-finalizing`;
           await fs.promises.rm(temporaryPath, { force: true });
-          await fs.promises.copyFile(partialPath, temporaryPath);
-          await fs.promises.chmod(temporaryPath, 0o600);
-          const temporary = await fs.promises.open(temporaryPath, "r");
-          try { await temporary.sync(); } finally { await temporary.close(); }
+          const temporary = await fs.promises.open(temporaryPath, "wx", 0o600);
+          try {
+            const source = await fs.promises.open(partialPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+            try {
+              for await (const chunk of source.createReadStream({ autoClose: false })) {
+                const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+                let offset = 0;
+                while (offset < buffer.length) {
+                  const written = await temporary.write(buffer, offset, buffer.length - offset);
+                  if (!written.bytesWritten) throw new Error("UPLOAD_WRITE_STALLED");
+                  offset += written.bytesWritten;
+                }
+              }
+            } finally { await source.close(); }
+            await temporary.sync();
+          } finally { await temporary.close(); }
           await fs.promises.rename(temporaryPath, finalPath);
-          await fs.promises.rm(partialPath, { force: true });
         }
-      } else if (finalStat.size !== upload.size) {
-        throw new Error("Final upload size mismatch");
+      } else if (!finalStat.isFile() || finalStat.nlink !== 1 || finalStat.size !== upload.size) {
+        throw new Error("Final upload size or inode mismatch");
       } else {
         upload = this.db.markResumableUploadFinalizing(upload.id, upload.size) ?? upload;
       }
-      await this.removePartials(upload);
-      const sha256 = await sha256File(finalPath);
-      const file: FileRow = {
+      file = await fs.promises.open(finalPath, fs.constants.O_RDWR | fs.constants.O_NOFOLLOW);
+      const stat = await file.stat();
+      if (!stat.isFile() || stat.nlink !== 1 || stat.size !== upload.size) throw new Error("Final upload size or inode mismatch");
+      // Rename retains the private staging mode; destination default ACLs do
+      // not apply. This must succeed on normal, EXDEV and restart paths alike.
+      grantCompletedUploadAccess(file, upload.user_id);
+      await file.sync();
+      await directory.sync();
+      const sha256 = await sha256File(file);
+      const parent = await openUploadDirectory(this.config.tenantRoot, [upload.user_id, "conversations", upload.conversation_id, "uploads"]);
+      try {
+        const current = await fs.promises.lstat(`/proc/self/fd/${parent.fd}/${upload.final_name}`);
+        const parentStat = await parent.stat(), pinned = await directory.stat();
+        if (parentStat.dev !== pinned.dev || parentStat.ino !== pinned.ino || !current.isFile()
+          || current.dev !== stat.dev || current.ino !== stat.ino || current.nlink !== 1 || current.size !== upload.size) {
+          throw new Error("Completed upload path changed");
+        }
+      } finally { await parent.close(); }
+      const row: FileRow = {
         id: upload.file_id, conversation_id: upload.conversation_id, message_id: null, pending_prompt_id: null,
         composer_draft_id: upload.conversation_id, original_name: upload.original_name,
         relative_path: path.posix.join("uploads", upload.final_name), mime_type: upload.mime_type,
         size: upload.size, sha256, kind: "upload", created_at: upload.created_at,
       };
-      const completed = this.db.completeResumableUpload(upload.id, file, this.maximumStoredBytesForUser(upload.user_id));
+      assertOwner();
+      const completed = this.db.completeResumableUpload(upload.id, row, this.maximumStoredBytesForUser(upload.user_id));
+      await this.removePartials(upload);
       console.info(JSON.stringify({ event: "resumable_upload_completed", uploadId: upload.id, userId: upload.user_id, conversationId: upload.conversation_id, size: upload.size, sha256 }));
       return completed;
     } finally {
-      this.locks.delete(`${upload.id}:finalize`);
+      await file?.close();
+      await directory.close();
     }
   }
 

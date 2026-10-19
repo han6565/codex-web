@@ -241,3 +241,7 @@ stateDiagram-v2
 - Recurring tasks and conversations load together; compact schedule forms retain model/effort choices and format long intervals clearly. Default conversation titles retry on a later user message without overwriting a manual title.
 - [Bounded writer shutdown](docs/APP_SERVER_SHUTDOWN.md) waits for the actual process group to exit; shared account token refresh can safely commit from an isolated tenant.
 - Remote Worker **1.20.2** raises automatic result delivery to **256 files**, retaining the 2 GiB per-file, 8 GiB per-batch and 30-minute transfer limits. Existing node transfer UI/skills remain available only with configured capabilities.
+
+## 近期能力
+
+受管交互 HTML 附件在隔离沙箱中运行，支持本人确认导出、独立版本及默认私有分享。可选[判断簿](docs/JUDGMENT_BOOK.md)保留本人概率、证据与确认；项目定时支持每日时间窗口和一次性核验，新会话可保存账号独立的模型选择。机会语音上传后后台识别并自动保存；项目菜单可清除当前未读。瞬时路由恢复及 SQLite 收尾容错保留已提交成果。升级见[迁移说明](docs/UPGRADE_20261020.md)。

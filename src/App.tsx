@@ -1,3 +1,7 @@
+import { JudgmentWorkspace, JudgmentSidebar } from "./judgments";
+import { WebPresentation } from "./web-presentation";
+import { FileShareDialog } from "./file-share-dialog";
+import { ExtensionsSidebar } from './extensions-sidebar';
 import { OpportunityWorkspace } from "./opportunities";
 import { OpportunitySidebar } from "./opportunity-sidebar";
 import { RecurringSidebar, RecurringWorkspace } from "./recurring-tasks";
@@ -43,8 +47,6 @@ import { buildHandoffFirstTurn, CONTEXT_HANDOFF_PROMPT, latestContextHandoff } f
 import { PersonalMemoryDialog } from "./personal-memory-dialog";
 import { VoiceLexiconDialog } from "./voice-lexicon-dialog";
 import { PublicSharesDialog } from "./public-shares-dialog";
-import { isPublicShareActive, publicShareRemaining } from "./public-share";
-import { useShareClock } from "./use-share-clock";
 import { canApplyDeferredInstanceReload } from "./reload-protection";
 import { AccountAuthDialog } from "./account-auth-dialog";
 import { DisplaySettingsDialog } from "./display-settings-dialog";
@@ -333,81 +335,6 @@ function ReaderSelectionLayer({ rootRef, scopeKey, annotations, onAsk, onHighlig
   return selection ? <ReaderSelectionAction selection={selection} onAsk={() => onAsk(selection)} onHighlight={toggleHighlight} onNote={onNote} highlighted={Boolean(existingHighlight)} /> : null;
 }
 
-function FileShareDialog({ file, share, onChange, open, onClose }: { file: Pick<WorkFile, "id" | "original_name">; share: FileShareState; onChange: (share: FileShareState) => void; open: boolean; onClose: () => void }) {
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState("");
-  const [copied, setCopied] = useState(false);
-  const closeButton = useRef<HTMLButtonElement>(null);
-  const now = useShareClock(open);
-  const active = isPublicShareActive(share.enabled, share.expiresAt, now);
-  const expired = share.expired || (share.enabled && !active);
-
-  const closeDialog = useCallback(() => {
-    onClose();
-    setError("");
-  }, [onClose]);
-
-  useEffect(() => {
-    if (!open) return;
-    const focusFrame = window.requestAnimationFrame(() => closeButton.current?.focus({ preventScroll: true }));
-    const closeEscape = (event: globalThis.KeyboardEvent) => {
-      if (event.key === "Escape") closeDialog();
-    };
-    document.addEventListener("keydown", closeEscape);
-    return () => {
-      window.cancelAnimationFrame(focusFrame);
-      document.removeEventListener("keydown", closeEscape);
-    };
-  }, [closeDialog, open]);
-
-  async function enable() {
-    setBusy(true); setError("");
-    try { onChange((await api.enableFileShare(file.id)).share); }
-    catch (reason) { setError(reason instanceof Error ? reason.message : "开启公开分享失败"); }
-    finally { setBusy(false); }
-  }
-
-  async function disable() {
-    if (!window.confirm("关闭后，这个固定链接及其中的图片将立即无法访问。确定关闭吗？")) return;
-    setBusy(true); setError("");
-    try { onChange((await api.disableFileShare(file.id)).share); }
-    catch (reason) { setError(reason instanceof Error ? reason.message : "关闭公开分享失败"); }
-    finally { setBusy(false); }
-  }
-
-  async function copyLink() {
-    try {
-      if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(share.publicUrl);
-      else {
-        const input = document.createElement("textarea");
-        input.value = share.publicUrl;
-        input.style.position = "fixed"; input.style.opacity = "0";
-        document.body.appendChild(input); input.select(); document.execCommand("copy"); input.remove();
-      }
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 1_500);
-    } catch { setError("复制失败，请手动复制链接。"); }
-  }
-
-  return open ? createPortal(<div className="file-share-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) closeDialog(); }}>
-      <section id="file-share-dialog" className="file-share-panel" role="dialog" aria-modal="true" aria-labelledby="file-share-dialog-title">
-        <header className="file-share-heading">
-          <div className="file-share-titleline"><strong id="file-share-dialog-title">公开分享</strong><span>{active ? "● 已开启" : expired ? "已到期" : "未开启"}</span></div>
-          <button ref={closeButton} className="file-share-close" type="button" aria-label="关闭分享设置" onClick={closeDialog}><X size={18} /></button>
-        </header>
-        <p>{active ? "任何获得链接的人都能查看此文件及配图。续期会从现在重新计算 30 天。" : expired ? "公开链接及配图已失效。重新开启后，原链接恢复访问，有效期为 30 天。" : "默认保持私有。开启后，获得链接的人可查看文件及配图，有效期为 30 天。"}</p>
-        {active && share.expiresAt && <p className="file-share-expiry">{publicShareRemaining(share.expiresAt, now)} · <time dateTime={share.expiresAt}>{new Date(share.expiresAt).toLocaleString("zh-CN", { hour12: false })}</time> 到期</p>}
-        {active && <input readOnly value={share.publicUrl} aria-label="公开链接" onFocus={(event) => event.currentTarget.select()} />}
-        {error && <div className="file-share-error">{error}</div>}
-        <div className="file-share-actions">
-          {active
-            ? <><button type="button" disabled={busy} onClick={() => void copyLink()}><Copy size={14} />{copied ? "已复制" : "复制链接"}</button><button type="button" disabled={busy} onClick={() => void enable()}><RefreshCw size={14} />续期 30 天</button><button className="danger" type="button" disabled={busy} onClick={() => void disable()}>关闭分享</button></>
-            : <button type="button" disabled={busy} onClick={() => void enable()}>{busy ? "正在开启…" : expired ? "重新开启分享（30 天）" : "开启公开分享（30 天）"}</button>}
-        </div>
-      </section>
-    </div>, document.body) : null;
-}
-
 function ReaderSettingsMenu({ file, share, download, themePreference, onThemePreferenceChange, onShareChange }: {
   file: Pick<WorkFile, "id" | "original_name" | "mime_type">;
   share: FileShareState | null;
@@ -416,9 +343,7 @@ function ReaderSettingsMenu({ file, share, download, themePreference, onThemePre
   onThemePreferenceChange: (preference: ThemePreference) => void;
   onShareChange: (share: FileShareState) => void;
 }) {
-  const [shareOpen, setShareOpen] = useState(false);
   const menu = useRef<HTMLDetailsElement>(null);
-  const shareable = fileReaderKind(file) === "html" || fileReaderKind(file) === "markdown";
 
   useEffect(() => {
     const closeOutside = (event: globalThis.PointerEvent) => {
@@ -434,9 +359,8 @@ function ReaderSettingsMenu({ file, share, download, themePreference, onThemePre
     <summary className="file-reader-settings-button" title="阅读器设置" aria-label="阅读器设置" aria-haspopup="menu"><Settings2 size={18} /></summary>
     <div className="file-reader-settings-popover" role="menu" aria-label="阅读器设置选项">
       {download && <ParaCollectButton fileId={file.id} menuItem onOpen={() => { if (menu.current) menu.current.open = false; }} />}
-      {shareable && share && <button className="file-reader-settings-item" type="button" role="menuitem" onClick={() => { if (menu.current) menu.current.open = false; setShareOpen(true); }}><Share2 size={15} /><span>分享</span></button>}
       {download && <a className="file-reader-settings-item" role="menuitem" href={download} download={file.original_name} onClick={() => { if (menu.current) menu.current.open = false; }}><Download size={15} /><span>下载</span></a>}
-      {(shareable && share || download) && <div className="file-reader-settings-divider" />}
+      {download && <div className="file-reader-settings-divider" />}
       <div className="file-reader-theme-label">颜色模式</div>
       <div className="file-reader-theme-options" role="group" aria-label="颜色模式">
         <button type="button" aria-label="使用浅色模式" aria-pressed={themePreference === "light"} className={themePreference === "light" ? "selected" : ""} onClick={() => onThemePreferenceChange("light")}><Sun size={14} /><span>浅色</span></button>
@@ -444,7 +368,6 @@ function ReaderSettingsMenu({ file, share, download, themePreference, onThemePre
         <button type="button" aria-label="外观跟随系统" aria-pressed={themePreference === "system"} className={themePreference === "system" ? "selected" : ""} onClick={() => onThemePreferenceChange("system")}><Monitor size={14} /><span>系统</span></button>
       </div>
     </div>
-    {shareable && share && <FileShareDialog file={file} share={share} onChange={onShareChange} open={shareOpen} onClose={() => setShareOpen(false)} />}
   </details>;
 }
 
@@ -613,6 +536,7 @@ function FilePreviewPage({ fileId, userInitials, onSessionExpired, resolvedTheme
         const metadata = await api.filePreview(fileId, controller.signal);
         if (controller.signal.aborted) return;
         setFile(metadata.file); setConversation(metadata.conversation); setShare(metadata.share);
+        if (metadata.file.presentation_mode === "web") { setLoading(false); return; }
         setConversationActivity({
           conversationStatus: metadata.conversation.status,
           externalStatus: metadata.conversation.external_status,
@@ -770,6 +694,8 @@ function FilePreviewPage({ fileId, userInitials, onSessionExpired, resolvedTheme
   const download = file ? fileUrl(file, true) : "";
   const taskRunning = Boolean(conversationActivity?.activeJob || conversationActivity?.externalStatus === "running" || conversationActivity?.conversationStatus === "running");
   const hasUnreadResult = Boolean(conversationActivity?.hasUnreadResult || conversation?.has_unread_result);
+  if (file?.presentation_mode === "web") return <WebPresentation fileId={fileId} />;
+
   return <main className={`file-preview-page ${readerKind ?? ""}`}>
     <header className="file-preview-header">
       <div className="file-preview-header-start">
@@ -798,7 +724,7 @@ function FilePreviewPage({ fileId, userInitials, onSessionExpired, resolvedTheme
 
 function PublicFilePreviewPage({ fileId, resolvedTheme, themePreference, onThemePreferenceChange }: { fileId: string; resolvedTheme: ResolvedTheme; themePreference: ThemePreference; onThemePreferenceChange: (preference: ThemePreference) => void }) {
   const viewId = useRef(globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`);
-  const [file, setFile] = useState<Pick<WorkFile, "id" | "original_name" | "mime_type" | "size" | "kind"> | null>(null);
+  const [file, setFile] = useState<Pick<WorkFile, "id" | "original_name" | "mime_type" | "size" | "kind" | "presentation_mode"> | null>(null);
   const [content, setContent] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -835,6 +761,8 @@ function PublicFilePreviewPage({ fileId, resolvedTheme, themePreference, onTheme
       document.removeEventListener("visibilitychange", verifyVisible);
     };
   }, [content, fileId]);
+
+  if (file?.presentation_mode === "web") return <WebPresentation fileId={fileId} publicView />;
 
   return <main className={`file-preview-page public ${readerKind ?? ""}`}>
     <header className="file-preview-header public">
@@ -1082,13 +1010,22 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   const [conversationBodySearchLoading, setConversationBodySearchLoading] = useState(false);
   const [projectDialogOpen, setProjectDialogOpen] = useState(false);
   const [createTypeOpen, setCreateTypeOpen] = useState(false);
+  const [judgmentVisible, setJudgmentVisible] = useState(false);
+  const [judgmentId, setJudgmentId] = useState<string|null>(null);
+  const judgmentDirty = useRef(false);
+  const markJudgmentDirty = useCallback((dirty:boolean) => { judgmentDirty.current=dirty; },[]);
+  function openJudgments(id?:string) {
+    if(!leaveRecurring() || !features.judgmentBook)return;
+    setParaVisible(false); setOpportunityVisible(false); setJudgmentVisible(true); setSidebarOpen(false);
+    if(id!==undefined)setJudgmentId(id);
+  }
+  useEffect(()=>{if(!features.judgmentBook)setJudgmentVisible(false);},[features.judgmentBook]);
   const [opportunityVisible, setOpportunityVisible] = useState(false);
   const opportunityLocationKey = `codex-web:${session.accountId}:opportunity-topic`;
   const [opportunityTopic, setOpportunityTopic] = useState(() => { try { return localStorage.getItem(opportunityLocationKey) || ""; } catch { return ""; } });
   const [opportunityCreate, setOpportunityCreate] = useState(false);
   useEffect(() => { try { localStorage.setItem(opportunityLocationKey, opportunityTopic); } catch { /* Private mode */ } }, [opportunityLocationKey, opportunityTopic]);
   const [opportunityNavigation, setOpportunityNavigation] = useState(0);
-  const [opportunityReturn, setOpportunityReturn] = useState(false);
   function openOpportunities(topicId?: string, create = false) {
     if (!leaveRecurring() || !features.opportunityCards) return;
     setParaVisible(false); setOpportunityVisible(true); setSidebarOpen(false);
@@ -1096,7 +1033,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     setOpportunityCreate(create);
     setOpportunityNavigation(n => n + 1);
   }
-  useEffect(() => { if (!features.opportunityCards) { setOpportunityVisible(false); setOpportunityReturn(false); } }, [features.opportunityCards]);
+  useEffect(() => { if (!features.opportunityCards) { setOpportunityVisible(false); } }, [features.opportunityCards]);
   const kanbanLocationKey = `codex-web:${session.accountId}:kanban-location`;
   const [initialKanbanLocation] = useState(() => {
     try {
@@ -1135,6 +1072,9 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   const recurringDirty = useRef(false);
   const markRecurringDirty = useCallback((dirty: boolean) => { recurringDirty.current = dirty; }, []);
   function leaveRecurring() {
+    if(judgmentDirty.current && !window.confirm("离开并放弃尚未保存的判断输入？"))return false;
+    judgmentDirty.current=false;
+    setJudgmentVisible(false);
     if (recurringDirty.current && !window.confirm("放弃周期任务尚未保存的修改？")) return false;
     recurringDirty.current = false; setRecurringView(null); return true;
   }
@@ -1155,6 +1095,9 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   }, [refreshRecurring]);
   const [projectSkillsDialogProject, setProjectSkillsDialogProject] = useState<Project | null>(null);
   const [syncingProjects, setSyncingProjects] = useState<Record<string, boolean>>({});
+  const [markingProjectsSeen, setMarkingProjectsSeen] = useState<Record<string, boolean>>({});
+  const markingProjectsSeenRef = useRef(new Set<string>());
+  const projectMenuPanelRef = useRef<HTMLDivElement>(null);
   const [projectMenu, setProjectMenu] = useState<{ projectId: string; top: number; left: number } | null>(null);
   const [projectSectionMenu, setProjectSectionMenu] = useState<{ top: number; left: number } | null>(null);
   const [taskMenu, setTaskMenu] = useState<{ conversationId: string; top: number; left: number } | null>(null);
@@ -2412,13 +2355,54 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     } catch (reason) { setError(reason instanceof Error ? reason.message : "项目重命名失败"); }
   }
 
+  useLayoutEffect(() => {
+    const panel = projectMenuPanelRef.current;
+    if (!panel || !projectMenu) return;
+    const bounds = panel.getBoundingClientRect();
+    if (bounds.bottom > window.innerHeight - 8) {
+      const top = Math.max(8, window.innerHeight - bounds.height - 8);
+      setProjectMenu((current) => current ? { ...current, top } : current);
+    }
+  }, [projectMenu?.projectId]);
+
+  async function markProjectSeen(project: Project) {
+    if (markingProjectsSeenRef.current.has(project.id)) return;
+    markingProjectsSeenRef.current.add(project.id);
+    setMarkingProjectsSeen((current) => ({ ...current, [project.id]: true }));
+    setProjectMenu(null);
+    setError(""); setNotice("");
+    const snapshot = new Map((projectConversationPagesRef.current[project.id]?.conversations ?? []).map((item) => [item.id, item]));
+    try {
+      const result = await api.markProjectSeen(project.id);
+      // Also clear retained/body-search rows that a normal list refresh omits.
+      // Leave any newer local result alone until the server refresh below.
+      const acknowledge = (item: Conversation): Conversation => {
+        const previous = snapshot.get(item.id);
+        return previous && item.updated_at === previous.updated_at && item.unread_anchor_message_id === previous.unread_anchor_message_id
+          ? { ...item, has_unread_result: 0, unread_anchor_message_id: null } : item;
+      };
+      const page = projectConversationPagesRef.current[project.id];
+      if (page) storeProjectConversationPage(project.id, { ...page, conversations: page.conversations.map(acknowledge) });
+      if (retainedConversationRef.current) retainedConversationRef.current = acknowledge(retainedConversationRef.current);
+      setDetail((current) => current ? { ...current, conversation: acknowledge(current.conversation) } : current);
+      // Fetch current state instead of blindly clearing a possibly newer result.
+      await refreshList(false, project.id);
+      setNotice(result.updatedCount ? `已去掉“${project.name}”的所有未读，新结果仍会正常提醒。` : `“${project.name}”没有未读任务。`);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "去掉未读失败，请重试");
+    } finally {
+      markingProjectsSeenRef.current.delete(project.id);
+      setMarkingProjectsSeen((current) => ({ ...current, [project.id]: false }));
+    }
+  }
+
   function toggleProjectMenu(project: Project, button: HTMLButtonElement) {
     if (projectMenu?.projectId === project.id) { setProjectMenu(null); return; }
     setProjectSectionMenu(null);
     setTaskMenu(null);
     const bounds = button.getBoundingClientRect();
     const width = 176;
-    const height = project.executor_id.startsWith("remote:") ? 176 : 136;
+    const height = project.executor_id.startsWith("remote:") ? 300 : 220;
     const top = bounds.bottom + 6 + height <= window.innerHeight - 8
       ? bounds.bottom + 6
       : Math.max(8, bounds.top - height - 6);
@@ -3755,7 +3739,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     ? projects.find((project) => project.id === selectedConversation.project_id)
     : undefined;
   const workspaceTitle = selectedConversation?.title || "Codex Web";
-  usePageTitle(opportunityVisible ? "机会卡片" : recurringView ? (recurringTasks.find(task => task.id === recurringView.taskId)?.name ?? "定时任务") : paraVisible ? null : selectedConversation?.title);
+  usePageTitle(judgmentVisible ? "判断簿" : opportunityVisible ? "机会卡片" : recurringView ? (recurringTasks.find(task => task.id === recurringView.taskId)?.name ?? "定时任务") : paraVisible ? null : selectedConversation?.title);
   const workspaceSubtitle = selectedProject?.display_name || selectedProject?.name || "PERSONAL AI WORKSTATION";
   const projectMenuProject = projectMenu ? projects.find((project) => project.id === projectMenu.projectId) : undefined;
   const taskMenuConversation = taskMenu
@@ -3766,7 +3750,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
   const isConversationUploading = (id: string) => Boolean(setSubmitting.get(id) || setSteering.get(id) || voiceTransfers[id] || setDraftUploads.get(id).some((upload) => upload.status === "uploading" || upload.status === "retrying"));
   const conversationRow = (conversation: Conversation, projectId?: string) => <div
     key={conversation.id}
-    className={`conversation-row ${!opportunityVisible && !recurringView && !paraVisible && selectedId === conversation.id ? "active" : ""} ${conversation.pinned_at ? "pinned" : ""} ${conversation.has_unread_result ? "unread" : ""} ${taskMenu?.conversationId === conversation.id ? "menu-open" : ""} ${draggedConversation?.id === conversation.id ? "dragging" : ""} ${conversationDropTarget?.id === conversation.id ? `drop-${conversationDropTarget.placement}` : ""}`}
+    className={`conversation-row ${!judgmentVisible && !opportunityVisible && !recurringView && !paraVisible && selectedId === conversation.id ? "active" : ""} ${conversation.pinned_at ? "pinned" : ""} ${conversation.has_unread_result ? "unread" : ""} ${taskMenu?.conversationId === conversation.id ? "menu-open" : ""} ${draggedConversation?.id === conversation.id ? "dragging" : ""} ${conversationDropTarget?.id === conversation.id ? `drop-${conversationDropTarget.placement}` : ""}`}
     draggable={Boolean(projectId && !query)}
     aria-grabbed={projectId ? draggedConversation?.id === conversation.id : undefined}
     onDragStart={projectId ? (event) => beginConversationDrag(event, conversation, projectId) : undefined}
@@ -3856,8 +3840,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
       </div>
       <div className="sidebar-content" onScroll={(event) => { setProjectMenu(null); setProjectSectionMenu(null); setTaskMenu(null); if (!session.projectMode) handleConversationListScroll(event); }}>
       <div className="search-box"><Search size={16} /><input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="搜索" aria-label="搜索" /><SearchVoiceInput query={query} projectId={activeProjectId} disabled={conversationListLoading} onTranscript={(text) => setQuery((current) => current ? `${current} ${text}` : text)} /></div>
-      {features.opportunityCards && <OpportunitySidebar key={session.accountId} query={query} selected={opportunityVisible ? opportunityTopic : null} onOpen={openOpportunities} onCreate={() => openOpportunities(undefined, true)} />}
-      {features.paraBoard && <ParaSidebar key={session.accountId} accountId={session.accountId!} query={query} selected={paraVisible ? paraBoardId : null} selectedProject={paraVisible ? paraProjectId : null} onOpen={openPara} onCreate={() => setCreateTypeOpen(true)} onDeleted={(id) => { if (id === paraBoardId) { setParaVisible(false); setOpportunityVisible(false); setParaBoardId(null); setParaProjectId(null); } }} />}
+      <ExtensionsSidebar judgments={features.judgmentBook && <JudgmentSidebar selected={judgmentVisible} query={query} onOpen={()=>openJudgments()} />} key={session.accountId} accountId={session.accountId!} query={query} onSettings={() => setFeatureSelectionOpen(true)} opportunities={features.opportunityCards && <OpportunitySidebar key={session.accountId} query={query} selected={opportunityVisible ? opportunityTopic : null} onOpen={openOpportunities} onCreate={() => openOpportunities(undefined, true)} />} boards={features.paraBoard && <ParaSidebar key={session.accountId} accountId={session.accountId!} query={query} selected={paraVisible ? paraBoardId : null} selectedProject={paraVisible ? paraProjectId : null} onOpen={openPara} onCreate={() => setCreateTypeOpen(true)} onDeleted={(id) => { if (id === paraBoardId) { setParaVisible(false); setOpportunityVisible(false); setParaBoardId(null); setParaProjectId(null); } }} />} />
       <div className="conversation-section">
         {session.projectMode && <div className="project-section">
           <div className="section-label project-label"><span>文件夹工程</span><button type="button" data-project-menu aria-label="项目操作" aria-haspopup="menu" aria-expanded={Boolean(projectSectionMenu)} title="项目操作" onClick={(event) => toggleProjectSectionMenu(event.currentTarget)}><MoreHorizontal size={15} /></button></div>
@@ -3995,11 +3978,12 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     </div>, document.body)}
 
     {projectMenu && projectMenuProject && createPortal(<div
+      ref={projectMenuPanelRef}
       className="project-menu-panel"
       data-project-menu
       role="menu"
       aria-label={`项目 ${projectMenuProject.name} 操作`}
-      style={{ top: projectMenu.top, left: projectMenu.left }}
+      style={{ top: projectMenu.top, left: projectMenu.left, maxHeight: "calc(100dvh - 16px)", overflowY: "auto" }}
     >
       {projectMenuProject.executor_id.startsWith("remote:") && <button
         type="button"
@@ -4007,6 +3991,7 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
         disabled={projectMenuProject.executor_status !== "online" || syncingProjects[projectMenuProject.id]}
         onClick={() => { setProjectMenu(null); void syncProject(projectMenuProject); }}
       ><RefreshCw size={16} className={syncingProjects[projectMenuProject.id] ? "spin" : ""} /><span>{syncingProjects[projectMenuProject.id] ? "正在刷新" : "刷新任务"}</span></button>}
+      <button type="button" role="menuitem" disabled={markingProjectsSeen[projectMenuProject.id]} onClick={() => void markProjectSeen(projectMenuProject)}><Check size={16} /><span>{markingProjectsSeen[projectMenuProject.id] ? "正在去掉未读" : "去掉所有未读"}</span></button>
       <button type="button" role="menuitem" onClick={() => openRecurring(projectMenuProject.id, null)}><Clock size={16} /><span>管理定时任务</span></button>
       <button type="button" role="menuitem" disabled={projectMenuProject.executor_id.startsWith("remote:")} title={projectMenuProject.executor_id.startsWith("remote:") ? "远端项目暂不支持网页管理技能" : "管理项目技能"} onClick={() => { setProjectMenu(null); setProjectSkillsDialogProject(projectMenuProject); }}><Pencil size={16} /><span>管理项目技能{projectMenuProject.executor_id.startsWith("remote:") ? "（远端暂不支持）" : ""}</span></button>
       <button type="button" role="menuitem" onClick={() => { setProjectMenu(null); void renameProject(projectMenuProject); }}><Pencil size={16} /><span>改名</span></button>
@@ -4056,19 +4041,19 @@ function Workspace({ session, onLogout, themePreference, onThemePreferenceChange
     />}
     {personalMemoryDialogOpen && <PersonalMemoryDialog onClose={() => setPersonalMemoryDialogOpen(false)} />}
     {voiceLexiconDialogOpen && <VoiceLexiconDialog onClose={() => setVoiceLexiconDialogOpen(false)} />}
-    {publicSharesDialogOpen && <PublicSharesDialog onClose={() => setPublicSharesDialogOpen(false)} />}
+    {publicSharesDialogOpen && <PublicSharesDialog onClose={() => setPublicSharesDialogOpen(false)} onSelect={(id) => { if (!leaveRecurring()) return; setPublicSharesDialogOpen(false); setSelectedId(id); }} />}
     {nodeTransfersOpen && createPortal(<NodeTransfersDialog onClose={() => setNodeTransfersOpen(false)} />, document.body)}
     {accountAuthDialogOpen && createPortal(<AccountAuthDialog onClose={() => setAccountAuthDialogOpen(false)} />, document.body)}
 
+    {features.judgmentBook && <JudgmentWorkspace projects={projects} visible={judgmentVisible} onMenu={()=>setSidebarOpen(true)} initialId={judgmentId} onIdChange={setJudgmentId} onDirty={markJudgmentDirty} onConversation={(pid,cid)=>{selectProjectConversation(pid,cid);void refreshList(false,pid);}}/>}
     {features.opportunityCards && <OpportunityWorkspace key={session.accountId} accountId={session.accountId!} projects={projects} visible={opportunityVisible} topicId={opportunityTopic} onTopicChange={setOpportunityTopic} createTopic={opportunityCreate} navigation={opportunityNavigation} onMenu={() => setSidebarOpen(true)} onCreateProject={() => setProjectDialogOpen(true)}
-      onConversation={(pid, cid) => { setOpportunityReturn(true); selectProjectConversation(pid, cid); void refreshList(false, pid); }}
-      onRecurring={(pid, tid) => { setOpportunityReturn(true); openRecurring(pid, tid); }} onProject={(bid, pid) => openPara(bid, pid)} />}
+      onConversation={(pid, cid) => { selectProjectConversation(pid, cid); void refreshList(false, pid); }}
+      onRecurring={(pid, tid) => { openRecurring(pid, tid); }} onProject={(bid, pid) => openPara(bid, pid)} />}
     {features.paraBoard && paraBoardId && <ParaWorkspace key={paraBoardId} boardId={paraBoardId} openProjectId={paraProjectId} navigationKey={paraNavigation} onNavigate={openPara} visible={paraVisible} accountId={session.accountId!} engines={projects}
       onMenu={() => setSidebarOpen(true)}
       onOpenConversation={(id, engineId) => { setParaVisible(false); setOpportunityVisible(false); setSidebarOpen(false); selectProjectConversation(engineId, id); void refreshList(false, engineId); }} />}
-    {recurringView && projects.find(p => p.id === recurringView.projectId) && <RecurringWorkspace onOpportunity={features.opportunityCards ? id => openOpportunities(id) : undefined} onReturnOpportunity={opportunityReturn && features.opportunityCards ? () => openOpportunities() : undefined} loading={recurringLoading} loadError={recurringError} project={projects.find(p => p.id === recurringView.projectId)!} tasks={recurringTasks.filter(t => t.project_id === recurringView.projectId)} taskId={recurringView.taskId} onOpen={id => openRecurring(recurringView.projectId, id)} onChanged={refreshRecurring} onMenu={() => setSidebarOpen(true)} onDirty={markRecurringDirty} onConversation={id => { selectProjectConversation(recurringView.projectId, id); void refreshList(false, recurringView.projectId); }} />}
-    <main style={opportunityVisible || recurringView || (features.paraBoard && paraVisible) ? { display: "none" } : undefined} className={`workspace ${currentDetail?.pendingPrompts.length ? "has-pending-queue" : ""}`}>
-      {opportunityReturn && features.opportunityCards && <button className="opportunity-return" onClick={() => openOpportunities()}><CornerUpLeft size={15} />返回机会卡片</button>}
+    {recurringView && projects.find(p => p.id === recurringView.projectId) && <RecurringWorkspace onJudgment={features.judgmentBook ? id=>openJudgments(id):undefined} onOpportunity={features.opportunityCards ? id => openOpportunities(id) : undefined} loading={recurringLoading} loadError={recurringError} project={projects.find(p => p.id === recurringView.projectId)!} tasks={recurringTasks.filter(t => t.project_id === recurringView.projectId)} taskId={recurringView.taskId} onOpen={id => openRecurring(recurringView.projectId, id)} onChanged={refreshRecurring} onMenu={() => setSidebarOpen(true)} onDirty={markRecurringDirty} onConversation={id => { selectProjectConversation(recurringView.projectId, id); void refreshList(false, recurringView.projectId); }} />}
+    <main style={judgmentVisible || opportunityVisible || recurringView || (features.paraBoard && paraVisible) ? { display: "none" } : undefined} className={`workspace ${currentDetail?.pendingPrompts.length ? "has-pending-queue" : ""}`}>
       <header className="workspace-header">
         <div className="workspace-header-start"><button className="icon-button mobile-only" onClick={() => setSidebarOpen(true)} aria-label="打开侧栏"><Menu size={20} /></button><div className="wordmark workspace-context" title={`${workspaceTitle} · ${workspaceSubtitle}`}><span className="brand-mark small">{selectedProject?.executor_id.startsWith("remote:") ? <Monitor size={15} /> : selectedProject ? <Folder size={15} /> : <Zap size={14} />}</span><span className="brand-copy workspace-context-copy"><strong>{workspaceTitle}{maintenancePhase !== "idle" && <span className="maintenance-state" role="status" aria-live="polite" title={maintenanceStatus?.message ?? undefined}>（<span className="maintenance-label">{maintenanceStatusLabel(maintenancePhase, maintenanceStatus)}</span> <LoaderCircle className="spin" size={11} />）</span>}</strong><small>{workspaceSubtitle}</small></span></div>{maintenanceStatus?.deployment && <details className={`deployment-status deployment-status-${deploymentStatusTone(maintenanceStatus.deployment)}`} role="status"><summary title={maintenanceStatus.deployment.message}><span className="deployment-status-dot" aria-hidden="true" /><span className="deployment-status-copy"><strong>发布 {deploymentStageNumber(maintenanceStatus.deployment.phase)}/{DEPLOYMENT_STAGES.length}</strong><small>{deploymentPhaseLabel(maintenanceStatus.deployment)}</small></span>{deploymentStatusTone(maintenanceStatus.deployment) === "active" && <LoaderCircle className="spin" size={13} />}{maintenanceStatus.deployment.requestId !== null && <span className="deployment-request">#{maintenanceStatus.deployment.requestId}</span>}</summary><div className="deployment-status-panel"><div className="deployment-status-heading"><strong>{maintenanceStatus.deployment.message}</strong>{maintenanceStatus.deployment.targetSha && <code title={maintenanceStatus.deployment.targetSha}>{maintenanceStatus.deployment.targetSha.slice(0, 7)}</code>}</div><ol>{DEPLOYMENT_STAGES.map((stage, index) => { const current = deploymentStageNumber(maintenanceStatus.deployment!.phase); const history = maintenanceStatus.deployment!.phaseHistory ?? []; const visited = history.some((entry) => entry.phase === stage.phase); const done = maintenanceStatus.deployment!.phase === "deployed" || index + 1 < current || (visited && stage.phase !== maintenanceStatus.deployment!.phase); const failed = !done && ["failed", "conflict", "deferred"].includes(maintenanceStatus.deployment!.phase) && index + 1 === current; return <li key={stage.phase} className={`${done ? "done" : ""} ${failed ? "failed" : ""} ${!done && !failed && index + 1 === current ? "current" : ""}`}><span aria-hidden="true" />{stage.label}</li>; })}</ol><DeploymentDetails status={maintenanceStatus.deployment} />{maintenanceStatus.deployment.errorSummary && <p className="deployment-status-error">{maintenanceStatus.deployment.errorSummary}</p>}</div></details>}</div>
         <div className="workspace-header-actions">
@@ -4799,7 +4784,7 @@ function AssistantFileLink({ href, children }: { href?: string; children?: React
   const context = useContext(AssistantFileLinkContext)!;
   const { files, messageId, remoteFileFetchEnabled, onFetchRemoteFile } = context;
   const resolved = resolveMessageFileLink(href, files, remoteFileFetchEnabled);
-  if (resolved.kind === "preview") return <a href={resolved.href} onClick={handleReaderLinkClick}>{children}</a>;
+  if (resolved.kind === "preview") return <a href={resolved.href} target={resolved.kind === "preview" && resolved.web ? "_blank" : undefined} rel={resolved.kind === "preview" && resolved.web ? "noreferrer" : undefined} onClick={resolved.kind === "preview" && resolved.web ? undefined : handleReaderLinkClick}>{children}</a>;
   if (resolved.kind === "raw") return <a href={resolved.href} target="_blank" rel="noreferrer">{children}</a>;
   if (resolved.kind === "download") return <a href={resolved.href} download>{children}</a>;
   if (resolved.kind === "unavailable" && remoteFileFetchEnabled && resolved.path) return <RemoteFileInlineLink sourcePath={resolved.path} onFetch={() => onFetchRemoteFile(messageId, resolved.path!)}>{children}</RemoteFileInlineLink>;
@@ -5210,27 +5195,28 @@ function RemoteFileCard({ sourcePath, onFetch }: { sourcePath: string; onFetch: 
 }
 
 function FileCard({ file }: { file: WorkFile }) {
+  const [shareOpen, setShareOpen] = useState(false);
   const image = file.mime_type.startsWith("image/");
   const icon = image ? null : <FileIcon size={20} />;
   const reader = fileReaderKind(file);
+  const web = file.presentation_mode === "web";
   const previewable = isBrowserPreviewable(file);
   const previewHref = reader ? filePreviewUrl(file) : previewable ? fileUrl(file) : "";
-  const body = <>{image && <img className="file-card-image" src={fileThumbnailUrl(file)} alt="" loading="lazy" />}{icon}<span><strong>{file.original_name}</strong><small>{formatSize(file.size)} · {file.kind === "output" ? "结果文件" : "上传文件"}</small></span></>;
-  // PDF/EPUB must enter the bounded reader by default.  Opening their raw
-  // attachment would hand EPUB to a browser download handler and would make
-  // PDF use the browser's unrestricted viewer, bypassing our pagination,
-  // Range and annotation boundaries.  Markdown keeps its established raw
-  // primary link; its eye action still opens the vertical reader.
+  const shareable = file.kind === "output" && (reader === "html" || reader === "markdown");
+  const body = <>{image && <img className="file-card-image" src={fileThumbnailUrl(file)} alt="" loading="lazy" />}{icon}<span><strong>{file.original_name}</strong><small>{web ? "交互网页" : reader === "html" || reader === "markdown" ? "阅读文档" : file.kind === "output" ? "结果文件" : "上传文件"} · {formatSize(file.size)}</small></span></>;
   const opensReaderByDefault = reader === "html" || reader === "pdf" || reader === "epub";
   return <div className={`file-card ${image ? "image-file-card" : ""}`}>
     {opensReaderByDefault
-      ? <a href={filePreviewUrl(file)} onClick={handleReaderLinkClick}>{body}</a>
-      : reader === "markdown" || previewable
-      ? <a href={fileUrl(file)} target="_blank" rel="noreferrer">{body}</a>
+      ? <a href={filePreviewUrl(file)} target={web ? "_blank" : undefined} rel={web ? "noreferrer" : undefined} onClick={web ? undefined : handleReaderLinkClick}>{body}</a>
+      : reader === "markdown" || previewable ? <a href={fileUrl(file)} target="_blank" rel="noreferrer">{body}</a>
       : <a href={fileUrl(file, true)} download={file.original_name}>{body}</a>}
-    {previewHref && <a className="preview-button" href={previewHref} target={reader ? undefined : "_blank"} rel={reader ? undefined : "noreferrer"} onClick={reader ? handleReaderLinkClick : undefined} title={reader ? "阅读（Alt + 点击在新标签页打开）" : "预览"} aria-label={`预览 ${file.original_name}`}><Eye size={16} /></a>}
-    <ParaCollectButton fileId={file.id} />
-    <a className="download-button" href={fileUrl(file, true)} download={file.original_name} title="下载"><Download size={16} /></a>
+    <div className="file-card-actions">
+      {previewHref && <a className="preview-button" href={previewHref} target={web || !reader ? "_blank" : undefined} rel={web || !reader ? "noreferrer" : undefined} onClick={reader && !web ? handleReaderLinkClick : undefined} title={web ? "打开交互网页" : "预览"} aria-label={`${web ? "打开" : "预览"} ${file.original_name}`}><Eye size={16} /></a>}
+      {shareable && <button className="share-button" type="button" title="分享" aria-label={`分享 ${file.original_name}`} onClick={() => setShareOpen(true)}><Share2 size={16} /></button>}
+      <a className="download-button" href={fileUrl(file, true)} download={file.original_name} title="下载" aria-label={`下载 ${file.original_name}`}><Download size={16} /></a>
+      <ParaCollectButton fileId={file.id} />
+    </div>
+    {shareOpen && <FileShareDialog fileId={file.id} onClose={() => setShareOpen(false)} />}
   </div>;
 }
 

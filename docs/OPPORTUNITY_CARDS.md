@@ -53,3 +53,7 @@ No new provider, environment variable or background model runner is introduced. 
 ## Upgrade and migration
 
 Back up the operator's own database and state before upgrading. Startup migrations `2026101403`, `2026101404` and `2026101405` add per-user topic order, feedback-learning progress/history and optional project-knowledge paths; existing topics and feedback remain, and old feedback initially awaits learning. Run the existing build/deploy workflow and verify SQLite integrity plus owner isolation after upgrade. Do not overwrite state with source or sample data. The environment template and Compose defaults need no new keys for this increment. A rollback of code does not restore the database; retain the pre-upgrade backup for an intentional data restore.
+
+## Feedback and research
+
+After a recording is durably uploaded, transcription continues in the background and appends feedback to the original card. Retained failed audio can be retried; revision checks expose concurrent edits. Research opens an editable draft and starts only when you send it. Images may reference archived conversation assets within the same account and authorized project.

@@ -1,6 +1,6 @@
 interface:
   display_name: "HTML Report"
-  short_description: "Generate a self-contained, mobile-readable UTF-8 HTML report"
-  default_prompt: "Use $html-report to create a self-contained HTML report from these findings."
+  short_description: "Create visual reports and interactive explanations for desktop and mobile"
+  default_prompt: "Use $html-report to present these findings with useful visuals and interaction where it helps understanding."
 policy:
   allow_implicit_invocation: true

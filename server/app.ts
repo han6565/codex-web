@@ -1,3 +1,8 @@
+import { OpportunityVoiceService } from './opportunity-voice.js';
+import { OpportunityError } from './opportunity-store.js';
+import { WEB_RUNTIME_CSP, validateWebDocument, verifiedWebBody } from "./web-presentation.js";
+import { WebRuntimeTickets, webRuntimeDocument } from "./web-runtime.js";
+import { mountJudgmentRoutes, mountJudgmentAutomation } from "./judgment-routes.js";
 import { mountOpportunityRoutes, mountOpportunityAutomation } from "./opportunity-routes.js";
 import { VoiceSubmissionService, VoiceSubmissionError } from "./voice-submissions.js";
 import { RecurringStore } from "./recurring-store.js";
@@ -196,6 +201,12 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     return selection;
   }
 
+  function newConversationAgentSelection(userId: string, options: AgentOptions): AgentSelection {
+    const baseline = db.getNewConversationAgentSelection(userId);
+    // A temporary executor catalog fallback must not rewrite the saved baseline.
+    return baseline ? repairAgentSelection(options, baseline.model, baseline.reasoningEffort) : userAgentSelection(userId, options);
+  }
+
   function safeConversationMessages(conversation: ConversationRow, messages: Array<MessageRow & { files: FileRow[] }>) {
     const citationFiles = db.listFiles(conversation.id);
     return messages.map((message) => {
@@ -296,6 +307,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     const conversation = db.getConversation(id);
     if (conversation && !conversation.deleted_at) publishConversationChanged(conversation);
   }, () => { if (config.queueAutoStart) scheduleQueuePump(); });
+  const opportunityVoice = new OpportunityVoiceService(config, db, transcription);
   const voiceTranscriptionInFlight = new Map<string, Promise<{ text: string; transcriptionId: string }>>();
   const conversationTitles = new ConversationTitleService((userId, executorId, prompt, timeoutMs) => runner.generateConversationTitle(userId, executorId, prompt, timeoutMs));
   const personalMemory = new PersonalMemoryService(config, db);
@@ -425,6 +437,8 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     },
   });
 
+  const webTickets = new WebRuntimeTickets();
+
   function publicPreviewPath(fileId: string): string {
     return `${config.basePath}/files/${encodeURIComponent(fileId)}/preview/public`;
   }
@@ -443,7 +457,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
   function publicShareState(req: Request, fileId: string) {
     const share = db.getPublicFileShare(fileId);
     const enabled = isPublicShareActive(share?.enabled, share?.expires_at);
-    return { enabled, expired: Boolean(share?.enabled && !enabled), expiresAt: share?.expires_at ?? null, publicUrl: publicPreviewUrl(req, fileId) };
+    return { enabled, expired: Boolean(share?.enabled && !enabled), status: enabled ? "active" : share?.enabled ? "expired" : share ? "closed" : "private", expiresAt: share?.expires_at ?? null, publicUrl: publicPreviewUrl(req, fileId) };
   }
 
   function publicResponseHeaders(res: Response): void {
@@ -500,6 +514,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
   async function waitForBackgroundTasks(): Promise<void> {
     while (backgroundTasks.size > 0) await Promise.allSettled([...backgroundTasks]);
     await voiceSubmissions.wait();
+    await opportunityVoice.wait();
     await reader.waitForBackgroundTasks();
   }
 
@@ -1129,6 +1144,16 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
         // runner. This lets other conversations start immediately while keeping
         // every turn in this conversation strictly serial.
         db.updateJob(job.id, "running");
+        // The publisher can close its gate between the last marker read and
+        // this database write. Recheck after reserving so an idle observation
+        // can never race into launching a task during the production switch.
+        if (codexUpdateMaintenanceActive()) {
+          db.updateJob(job.id, "queued");
+          maintenanceQueueWaiting = true;
+          publishQueuePositions();
+          wakeQueueAfterMaintenance();
+          break;
+        }
         db.updateConversation(job.conversation_id, { status: "running" });
         const startedConversation = db.getConversation(job.conversation_id);
         if (startedConversation) publishConversationChanged(startedConversation);
@@ -1377,6 +1402,54 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     message: { error: "公开文件访问过于频繁，请稍后再试。" },
   });
 
+  function runtimeFile(req: Request, ticketId: string) {
+    const ticket = webTickets.read(ticketId);
+    if (!ticket) return undefined;
+    const file = db.getFile(ticket.fileId);
+    if (!file || file.presentation_mode !== "web" || file.sha256 !== ticket.sha256) return undefined;
+    if (ticket.shareRevision !== null) {
+      const active = db.getActivePublicFile(file.id);
+      if (!active || active.share.revision !== ticket.shareRevision) return undefined;
+    } else {
+      const session = readSession(req, db, config);
+      if (!session || session.token_hash !== ticket.sessionHash || !db.getFileForUser(file.id, session.user_id)) return undefined;
+    }
+    const conversation = db.getConversation(file.conversation_id);
+    if (!conversation || conversation.deleted_at || conversation.deletion_state !== "active") return undefined;
+    try { return { file, body: verifiedWebBody(file, resolveFilePath(file, conversation.user_id)) }; }
+    catch { return undefined; }
+  }
+
+  api.head("/web-runtime/:ticket", publicShareLimiter, (req, res) => {
+    publicResponseHeaders(res);
+    const id = String(req.params.ticket);
+    const valid = runtimeFile(req, id);
+    if (valid) webTickets.keepAlive(id);
+    return res.status(valid ? 204 : 404).end();
+  });
+
+  api.get("/web-runtime/:ticket", publicShareLimiter, (req, res) => {
+    publicResponseHeaders(res);
+    res.setHeader("Content-Security-Policy", WEB_RUNTIME_CSP);
+    res.removeHeader("X-Frame-Options");
+    res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=(), serial=(), clipboard-read=(), clipboard-write=()");
+    const active = runtimeFile(req, String(req.params.ticket));
+    if (!active || req.get("sec-fetch-dest") === "document") return res.status(404).end();
+    return res.type("text/html; charset=utf-8").send(webRuntimeDocument(active.body, String(req.params.ticket)));
+  });
+
+  api.get("/files/:id/web-session/public", publicShareLimiter, (req, res) => {
+    publicResponseHeaders(res);
+    const active = activePublicDocument(String(req.params.id));
+    if (!active || active.file.presentation_mode !== "web") return res.status(404).json({ error: "分享已到期、关闭或文件不存在。" });
+    try { verifiedWebBody(active.file, active.absolute); }
+    catch { return res.status(404).json({ error: "网页版本校验失败。" }); }
+    const ticket = webTickets.issue(active.file, active.share.revision, null);
+    return res.json({ title: JSON.parse(active.file.presentation_manifest!).title, ticket, src: `${config.basePath}/api/web-runtime/${ticket}`, revision: active.share.revision });
+  });
+
+
+
   api.head("/files/:id/preview/public", publicShareLimiter, (req, res) => {
     publicResponseHeaders(res);
     if (!activePublicDocument(String(req.params.id))) return res.status(404).end();
@@ -1388,6 +1461,15 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     const fileId = String(req.params.id);
     const active = activePublicDocument(fileId);
     if (!active) return res.status(404).json({ error: "公开文件不存在，或分享已到期、关闭。" });
+    if (active.file.presentation_mode === "web") {
+      try {
+        verifiedWebBody(active.file, active.absolute);
+        const supplied = String(req.get("x-pp-view-id") ?? "");
+        const viewId = /^[A-Za-z0-9_-]{8,100}$/.test(supplied) ? supplied : String(res.locals.requestId);
+        db.recordPublicShareAccess(active.share.id, normalizedPublicIp(req), viewId, String(req.get("user-agent") ?? "").slice(0, 256) || null);
+        return res.json({ file: { id: active.file.id, original_name: active.file.original_name, mime_type: active.file.mime_type, size: active.file.size, kind: active.file.kind, presentation_mode: "web" }, content: null });
+      } catch { return res.status(404).json({ error: "网页版本不完整。" }); }
+    }
     let content: string;
     const embeddedUrls = new Set<string>();
     try {
@@ -1431,7 +1513,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
   api.get("/files/:id/preview/public/images/:revision/:index", publicShareLimiter, async (req, res) => {
     publicResponseHeaders(res);
     const active = activePublicDocument(String(req.params.id));
-    if (!active || !/^\d+$/.test(String(req.params.index)) || !/^[a-f0-9]{24}$/.test(String(req.params.revision))) return res.status(404).end();
+    if (!active || active.file.presentation_mode === "web" || !/^\d+$/.test(String(req.params.index)) || !/^[a-f0-9]{24}$/.test(String(req.params.revision))) return res.status(404).end();
     try {
       const image = await readerTextResources.image(active.absolute, String(req.params.revision), Number(req.params.index));
       if (!image || !activePublicDocument(String(req.params.id))) return res.status(404).end();
@@ -1444,7 +1526,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
   api.get("/files/:id/preview/public/assets/:assetId", publicShareLimiter, (req, res) => {
     publicResponseHeaders(res);
     const active = activePublicDocument(String(req.params.id));
-    if (!active) return res.status(404).json({ error: "公开图片不存在，或分享已到期、关闭。" });
+    if (!active || active.file.presentation_mode === "web") return res.status(404).json({ error: "公开图片不存在，或分享已到期、关闭。" });
     const assetId = String(req.params.assetId);
     const mapping = db.listPublicFileShareAssets(active.share.id).find((asset) => asset.asset_file_id === assetId);
     const asset = mapping ? db.getFile(assetId) : undefined;
@@ -1503,7 +1585,8 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     } catch (error) { return res.status(400).json({ error: error instanceof Error ? error.message : String(error) }); }
   }
 
-  mountOpportunityAutomation(api, db, authenticatedAutomationJob);
+  mountOpportunityAutomation(api, db, authenticatedAutomationJob, config.tenantRoot);
+  mountJudgmentAutomation(api, db, authenticatedAutomationJob, (user,executor) => newConversationAgentSelection(user, optionsForExecutor(user,executor)));
 
   function wakeDeadline(value: unknown): string | null {
     const seconds = Number(value);
@@ -1723,13 +1806,14 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     return next();
   });
 
-  mountOpportunityRoutes(api, db, { selection: (user, executor) => userAgentSelection(user, optionsForExecutor(user, executor)), changed: cid => { const c = db.getConversation(cid); if (c) publishConversationChanged(c); if (config.queueAutoStart) scheduleQueuePump(); } });
+  mountJudgmentRoutes(api, db, (user,executor) => newConversationAgentSelection(user, optionsForExecutor(user,executor)), cid => { const c = db.getConversation(cid); if(c) publishConversationChanged(c); });
+  mountOpportunityRoutes(api, db, { tenantRoot: config.tenantRoot, activate: cid => { const c = db.getConversation(cid); return c ? activateConversation(c).state : 'unavailable'; }, selection: (user, executor) => newConversationAgentSelection(user, optionsForExecutor(user, executor)), changed: cid => { const c = db.getConversation(cid); if (c) publishConversationChanged(c); if (config.queueAutoStart) scheduleQueuePump(); } });
 
   mountRecurringRoutes(api, db, (user, executor, model, effort) => resolveAgentSelection(optionsForExecutor(user, executor), model, effort));
 
   mountParaRoutes(api, { db, config, resolveFile: resolveExistingFilePath,
     restore: (id) => { const c = db.getConversation(id); if (c) activateConversation(c); },
-    selection: (user, executor) => userAgentSelection(user, optionsForExecutor(user, executor)),
+    selection: (user, executor) => newConversationAgentSelection(user, optionsForExecutor(user, executor)),
     executorOnline: (executor) => executorView(executor)?.status === "online",
     maximumBytes: maximumStoredBytesForUser,
   });
@@ -1775,6 +1859,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     const session = res.locals.session as SessionRow;
     const file = db.getFileForUser(String(req.params.id), session.user_id);
     if (!file) return res.status(404).json({ error: "文件不存在。" });
+    if (file.presentation_mode === "web") return res.status(415).json({ error: "交互网页请从运行入口打开。" });
     db.touchConversationActivity(file.conversation_id);
     try {
       const manifest = await reader.openFile(file, session.user_id);
@@ -2440,6 +2525,14 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     return project ? res.json({ project: projectView(project) }) : res.status(404).json({ error: "项目不存在。" });
   });
 
+  api.post("/projects/:id/seen", (req, res) => {
+    const session = res.locals.session as SessionRow;
+    const updatedCount = db.markProjectResultsSeenForUser(String(req.params.id), session.user_id);
+    return updatedCount === undefined
+      ? res.status(404).json({ error: "项目不存在。" })
+      : res.json({ updatedCount });
+  });
+
   api.post("/projects/:id/archive", (req, res) => {
     const session = res.locals.session as SessionRow;
     const projectId = String(req.params.id);
@@ -2588,7 +2681,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
       ...options,
       selection: requestedConversation
         ? conversationAgentSelection(requestedConversation, options)
-        : userAgentSelection(session.user_id, options),
+        : newConversationAgentSelection(session.user_id, options),
     });
   });
 
@@ -2596,6 +2689,31 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     const session = res.locals.session as SessionRow;
     try { return res.json({ selection: saveAgentSelection(session.user_id, req.body?.model, req.body?.reasoningEffort, undefined, typeof req.body?.executorId === "string" ? req.body.executorId : undefined) }); }
     catch (error) { return res.status(400).json({ error: error instanceof Error ? error.message : "模型选项无效。" }); }
+  });
+
+  api.get("/user-settings/new-conversation-agent-selection", (_req, res) => {
+    res.setHeader("Cache-Control", "private, no-store");
+    return res.json({ selection: db.getNewConversationAgentSelection((res.locals.session as SessionRow).user_id) ?? null });
+  });
+
+  api.put("/user-settings/new-conversation-agent-selection", (req, res) => {
+    const session = res.locals.session as SessionRow;
+    if (typeof req.body?.model !== "string" || !req.body.model.trim()
+      || typeof req.body?.reasoningEffort !== "string" || !req.body.reasoningEffort.trim()
+      || Object.keys(req.body).some(key => !["model", "reasoningEffort"].includes(key))) {
+      return res.status(400).json({ error: "新会话默认选项无效。" });
+    }
+    try {
+      const project = db.getDefaultProject(session.user_id);
+      const selection = resolveAgentSelection(optionsForExecutor(session.user_id, project?.executor_id), req.body.model, req.body.reasoningEffort);
+      db.setNewConversationAgentSelection(session.user_id, selection);
+      return res.json({ selection });
+    } catch (error) { return res.status(400).json({ error: error instanceof Error ? error.message : "模型选项无效。" }); }
+  });
+
+  api.delete("/user-settings/new-conversation-agent-selection", (_req, res) => {
+    db.setNewConversationAgentSelection((res.locals.session as SessionRow).user_id, null);
+    return res.status(204).end();
   });
 
   api.get("/user-settings/features", (_req, res) => {
@@ -2606,7 +2724,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
   api.put("/user-settings/features", (req, res) => {
     const session = res.locals.session as SessionRow;
     res.setHeader("Cache-Control", "private, no-store");
-    if (!isFeatureSelection(req.body) || Object.keys(req.body).some(key => !["paraBoard", "opportunityCards", "revision"].includes(key))) {
+    if (!isFeatureSelection(req.body) || Object.keys(req.body).some(key => !["paraBoard", "opportunityCards", "judgmentBook", "revision"].includes(key))) {
       return res.status(400).json({ error: "功能选择无效，请重新打开设置。" });
     }
     const features = db.setFeatureSelection(session.user_id, req.body);
@@ -2639,18 +2757,23 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
       : db.getDefaultProject(session.user_id);
     if (!project) return res.status(400).json({ error: "请先选择项目。" });
     const reuseEmpty = req.body?.reuseEmpty !== false;
+    // Preserve explicitly changed empty conversations instead of resetting them
+    // or inheriting their temporary choice when the user asks for a new task.
+    const reuseSelection = db.getNewConversationAgentSelection(session.user_id)
+      ? newConversationAgentSelection(session.user_id, optionsForExecutor(session.user_id, project.executor_id))
+      : undefined;
     if (reuseEmpty) {
-      const reusable = db.reuseEmptyConversationForNewTask(session.user_id, project.id);
+      const reusable = db.reuseEmptyConversationForNewTask(session.user_id, project.id, reuseSelection);
       if (reusable) {
         return res.json({ conversation: reusable, agentSelection: conversationAgentSelection(reusable), reused: true });
       }
     }
     const id = newId();
-    const agentSelection = userAgentSelection(session.user_id, optionsForExecutor(session.user_id, project.executor_id));
+    const agentSelection = reuseSelection ?? userAgentSelection(session.user_id, optionsForExecutor(session.user_id, project.executor_id));
     const workspace = ensureTenantWorkspace(config.tenantRoot, session.user_id, id);
     try {
       const result = reuseEmpty
-        ? db.createOrReuseEmptyConversation(id, agentSelection, session.user_id, project.id)
+        ? db.createOrReuseEmptyConversation(id, agentSelection, session.user_id, project.id, reuseSelection)
         : { conversation: db.createConversation(id, "新任务", agentSelection, session.user_id, project.id), reused: false };
       if (result.reused) fs.rmSync(workspace, { recursive: true, force: true });
       return res.status(result.reused ? 200 : 201).json({
@@ -3030,6 +3153,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     const id = String(req.params.id);
     const existing = db.getConversationForUser(id, session.user_id) ?? db.getConversationCleanupForUser(id, session.user_id);
     if (!existing) return res.status(404).json({ error: "会话不存在。" });
+    if (db.judgmentAttachmentProtectsConversation(existing.id)) return res.status(409).json({error:"此会话有判断簿引用的证据附件，请保留会话；可以归档，冷存储不受影响。"});
     if (deletingConversations.has(existing.id)) return res.status(409).json({ code: "CONVERSATION_DELETING", cleanupState: "deleting", error: "会话正在删除。" });
     const conversation = db.beginConversationDeletion(existing.id, session.user_id);
     if (!conversation) return res.status(409).json({ code: "CONVERSATION_DELETE_CONFLICT", error: "会话删除状态已经变化。" });
@@ -3229,6 +3353,33 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     if (!voiceSubmissions.retry(session.user_id, pending.id)) return res.status(409).json({ error: "语音状态已变化，请刷新后重试。" });
     res.status(202).json({ accepted: true });
     scheduleBackground("voice_submission_retry", () => voiceSubmissions.pump());
+  });
+
+  api.post('/opportunities/ideas/:id/voice-feedback', transcriptionLimiter, voiceUpload.single('audio'), (req, res) => {
+    const file = req.file;
+    if (!file) return res.status(400).json({ error: '没有收到可识别的录音。' });
+    try {
+      const user = (res.locals.session as SessionRow).user_id;
+      const recordingId = String(req.body?.clientRecordingId ?? '');
+      const draftText = typeof req.body?.draftText === 'string' ? req.body.draftText : '';
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(recordingId) || draftText.length > 6000) return res.status(400).json({ error: '录音 ID 或反馈长度无效。' });
+      const submission = opportunityVoice.accept({ user, ideaId: String(req.params.id), recordingId, draftText, filePath: file.path, mimeType: file.mimetype.split(';', 1)[0]!, maximumBytes: maximumStoredBytesForUser(user) });
+      res.status(202).json({ accepted: true, submission });
+      scheduleBackground('opportunity_voice', () => opportunityVoice.pump());
+    } catch (error) {
+      if (error instanceof OpportunityError) return res.status(error.status).json({ error: error.message });
+      throw error;
+    } finally { fs.rmSync(file.path, { force: true }); }
+  });
+  api.post('/opportunities/ideas/:id/voice-feedback/:voiceId/retry', (req, res) => {
+    try {
+      opportunityVoice.retry((res.locals.session as SessionRow).user_id, String(req.params.id), String(req.params.voiceId));
+      res.status(202).json({ accepted: true });
+      scheduleBackground('opportunity_voice_retry', () => opportunityVoice.pump());
+    } catch (error) {
+      if (error instanceof OpportunityError) return res.status(error.status).json({ error: error.message });
+      throw error;
+    }
   });
 
   api.post("/transcriptions", transcriptionLimiter, voiceRequestTiming, voiceUpload.single("audio"), async (req, res) => {
@@ -3745,11 +3896,75 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
     }
   });
 
+  function shareMetadata(file: FileRow, req: Request) {
+    return { file: { id: file.id, original_name: file.original_name, mime_type: file.mime_type, size: file.size, kind: file.kind, presentation_mode: file.presentation_mode ?? "reader", previous_file_id: file.previous_file_id },
+      share: publicShareState(req, file.id), conversationId: file.conversation_id,
+      storageState: db.getConversationStorage(file.conversation_id)?.state ?? "local" };
+  }
+  api.get("/files/:id/share", (req, res) => {
+    const file = db.getFileForUser(String(req.params.id), (res.locals.session as SessionRow).user_id);
+    if (!file) return res.status(404).json({ error: "文件不存在。" });
+    res.setHeader("Cache-Control", "private, no-store");
+    return res.json(shareMetadata(file, req));
+  });
+  api.post("/files/:id/restore", (req, res) => {
+    const session = res.locals.session as SessionRow;
+    const file = db.getFileForUser(String(req.params.id), session.user_id);
+    if (!file) return res.status(404).json({ error: "文件不存在。" });
+    try {
+      const state = activateConversation(db.getConversationForUser(file.conversation_id, session.user_id)!).state;
+      return res.status(state === "restoring" ? 202 : 200).json({ ...shareMetadata(file, req), restoring: state === "restoring" });
+    } catch (error) { return readerRequestError(res, error); }
+  });
+  api.get("/files/:id/web-session", (req, res) => {
+    const session = res.locals.session as SessionRow;
+    const file = db.getFileForUser(String(req.params.id), session.user_id);
+    if (!file || file.presentation_mode !== "web") return res.status(404).json({ error: "不是已登记的交互网页。" });
+    res.setHeader("Cache-Control", "private, no-store");
+    try {
+      if (reader.ensureOriginalFileAvailable(file, session.user_id) === "restoring") return res.status(202).json({ restoring: true });
+      verifiedWebBody(file, resolveFilePath(file, session.user_id));
+      const ticket = webTickets.issue(file, null, session.token_hash);
+      return res.json({ title: JSON.parse(file.presentation_manifest!).title, ticket, src: `${config.basePath}/api/web-runtime/${ticket}` });
+    } catch (error) { return readerRequestError(res, error); }
+  });
+  api.post("/files/:id/presentation-version", (req, res) => {
+    const session = res.locals.session as SessionRow;
+    const original = db.getFileForUser(String(req.params.id), session.user_id);
+    if (!original) return res.status(404).json({ error: "文件不存在。" });
+    const mode = req.body?.presentation_mode;
+    if (!["reader", "web"].includes(mode) || publicShareDocumentKind(original) !== "html") return res.status(400).json({ error: "请选择 HTML 的阅读文档或交互网页类型。" });
+    const storage = db.getConversationStorage(original.conversation_id);
+    if (storage && storage.state !== "local") return res.status(409).json({ error: "请先恢复来源会话，再重新交付。" });
+    if (original.size > PUBLIC_FILE_READER_MAX_BYTES) return res.status(413).json({ error: "重新交付仅支持 5 MiB 以内的 HTML。" });
+    let destination: string | undefined;
+    try {
+      const sourcePath = resolveFilePath(original, session.user_id);
+      const sourceStat = fs.lstatSync(sourcePath);
+      if (!sourceStat.isFile() || sourceStat.isSymbolicLink() || sourceStat.size !== original.size) throw new Error("原版本文件不完整。");
+      const body = fs.readFileSync(sourcePath);
+      if (body.length > PUBLIC_FILE_READER_MAX_BYTES) return res.status(413).json({ error: "重新交付仅支持 5 MiB 以内的 HTML。" });
+      const manifest = mode === "web" ? JSON.stringify(validateWebDocument(body, original.original_name, false)) : null;
+      const id = newId();
+      const file: FileRow = { ...original, id, kind: "output", relative_path: path.posix.join("deliverables", id, original.original_name),
+        pending_prompt_id: null, composer_draft_id: null, presentation_mode: mode, presentation_manifest: manifest, previous_file_id: original.id,
+        size: body.length, sha256: crypto.createHash("sha256").update(body).digest("hex"), created_at: new Date().toISOString() };
+      destination = resolveFilePath(file, session.user_id);
+      fs.mkdirSync(path.dirname(destination), { recursive: true });
+      fs.writeFileSync(destination, body, { flag: "wx", mode: 0o600 });
+      db.addFiles([file], session.user_id, maximumStoredBytesForUser(session.user_id));
+      return res.status(201).json({ ...shareMetadata(file, req), file });
+    } catch (error) {
+      if (destination) fs.rmSync(path.dirname(destination), { recursive: true, force: true });
+      return res.status(422).json({ error: error instanceof Error ? error.message : "重新交付失败。" });
+    }
+  });
+
   api.get("/files/:id/preview/content", async (req, res) => {
     const session = res.locals.session as SessionRow;
     const file = db.getFileForUser(String(req.params.id), session.user_id);
     if (!file) return res.status(404).json({ error: "文件不存在。" });
-    if (!publicShareDocumentKind(file)) return res.status(415).json({ error: "该文件不支持正文预览。" });
+    if (file.presentation_mode === "web" || !publicShareDocumentKind(file)) return res.status(415).json({ error: "该文件不支持正文预览。" });
     try {
       const absolute = resolveExistingFilePath(file, session.user_id);
       if (!fs.existsSync(absolute) && reader.ensureOriginalFileAvailable(file, session.user_id) === "restoring") {
@@ -3765,7 +3980,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
   api.get("/files/:id/preview/images/:revision/:index", async (req, res) => {
     const session = res.locals.session as SessionRow;
     const file = db.getFileForUser(String(req.params.id), session.user_id);
-    if (!file || !publicShareDocumentKind(file)) return res.status(404).end();
+    if (!file || file.presentation_mode === "web" || !publicShareDocumentKind(file)) return res.status(404).end();
     if (!/^\d+$/.test(String(req.params.index)) || !/^[a-f0-9]{24}$/.test(String(req.params.revision))) return res.status(404).end();
     try {
       const image = await readerTextResources.image(resolveExistingFilePath(file, session.user_id), String(req.params.revision), Number(req.params.index));
@@ -3791,6 +4006,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
         original_name: file.original_name,
         relative_path: file.relative_path,
         source_path: file.source_path,
+        presentation_mode: file.presentation_mode ?? "reader",
         mime_type: file.mime_type,
         size: file.size,
         kind: file.kind,
@@ -3809,7 +4025,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
 
   api.get("/public-shares", (req, res) => {
     const session = res.locals.session as SessionRow;
-    const shares = db.listActivePublicFileShares(session.user_id).flatMap((share) => {
+    const shares = db.listPublicFileShares(session.user_id).flatMap((share) => {
       const documentKind = publicShareDocumentKind({ original_name: share.current_file_name, mime_type: share.mime_type });
       if (!documentKind) return [];
       return [{
@@ -3821,6 +4037,9 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
         size: share.size,
         conversationId: share.conversation_id,
         conversationTitle: share.conversation_title,
+        enabled: Boolean(share.enabled),
+        presentationMode: share.presentation_mode,
+        storageState: share.storage_state,
         enabledAt: share.enabled_at,
         expiresAt: share.expires_at,
         publicUrl: publicPreviewUrl(req, share.file_id),
@@ -3849,10 +4068,11 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
       const stat = fs.statSync(absolute);
       if (!stat.isFile() || stat.size !== file.size) return res.status(404).json({ error: "文件不存在。" });
       content = fs.readFileSync(absolute, "utf8").replace(/^\uFEFF/, "");
-    } catch { return res.status(404).json({ error: "文件不存在。" }); }
+    } catch { return res.status(409).json({ error: "文件已冷存储，请先恢复完整版本，再开启分享。", code: "RESTORE_REQUIRED" }); }
     try {
       const siblings = file.message_id ? db.listFilesForMessage(file.message_id) : [];
-      const assets = resolvePublicShareAssets(kind, content, siblings);
+      if (file.presentation_mode === "web") verifiedWebBody(file, absolute);
+      const assets = file.presentation_mode === "web" ? [] : resolvePublicShareAssets(kind, content, siblings);
       for (const reference of assets) {
         const asset = db.getFileForUser(reference.assetFileId, session.user_id);
         if (!asset || asset.message_id !== file.message_id || asset.kind !== "output" || !isPublicShareImage(asset)
@@ -3990,13 +4210,14 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
   if (config.queueAutoStart) {
     scheduleBackground("wake_scheduler_startup", processDueWakePlans);
     scheduleBackground("voice_submission_recovery", () => voiceSubmissions.pump());
+    scheduleBackground("opportunity_voice_recovery", () => opportunityVoice.pump());
     scheduleQueuePump();
     personalMemory.start();
     voiceLexicon.start();
   }
   if (config.queueAutoStart) resumableUploads.start();
   return {
-    app, db, runner, conversationTitles, personalMemory, voiceLexicon, voiceSubmissions, config, pumpQueue, remoteWorkers, nodeTransfers, resumableUploads, waitForBackgroundTasks,
+    app, db, runner, conversationTitles, personalMemory, voiceLexicon, voiceSubmissions, opportunityVoice, config, pumpQueue, remoteWorkers, nodeTransfers, resumableUploads, waitForBackgroundTasks,
     beginShutdown: () => {
       shuttingDown = true;
       nodeTransfers.close();
@@ -4004,6 +4225,7 @@ export function createApp(overrides: Partial<AppConfig> = {}) {
       personalMemory.stop();
       voiceLexicon.stop();
       voiceSubmissions.stop();
+      opportunityVoice.stop();
       resumableUploads.stop();
       if (wakeSchedulerTimer) clearInterval(wakeSchedulerTimer);
       wakeSchedulerTimer = undefined;

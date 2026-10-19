@@ -16,10 +16,8 @@ export async function run({ page, context, origin, work, assert, fixtures }) {
     return response.status() === 204 ? null : response.json();
   }
   async function openShare(file) {
-    await page.goto(`${origin}/files/${file.id}/preview`, { waitUntil: 'domcontentloaded' });
-    await page.locator('.reader-text-container').waitFor();
-    await page.locator('.file-reader-settings-button').click();
-    await page.getByRole('menuitem', { name: '分享', exact: true }).click();
+    await page.goto(origin, { waitUntil: 'domcontentloaded' });
+    await page.getByRole('button', { name: '分享 ' + file.name, exact: true }).click();
     await page.locator('#file-share-dialog').waitFor();
   }
   async function clickShare(file, name) {
@@ -92,17 +90,19 @@ export async function run({ page, context, origin, work, assert, fixtures }) {
         await page.getByRole('button', { name: '公开分享管理', exact: true }).click();
         const row = page.locator('.public-share-row').filter({ has: page.getByRole('link', { name: file.name, exact: true }) });
         await row.waitFor();
+        await row.getByRole('button', {name:'管理分享',exact:true}).click();
+        const sharePanel=page.locator('#file-share-dialog');
         const response = page.waitForResponse(r => r.url() === `${origin}/api/files/${file.id}/share` && r.request().method() === 'POST');
-        await row.getByRole('button', { name: '续期 30 天', exact: true }).click();
+        await sharePanel.getByRole('button', { name: '续期 30 天', exact: true }).click();
         assert.equal((await response).status(), 200);
         assert.match(await row.innerText(), /剩余 30 天/);
         assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
         await row.screenshot({ path: path.join(work, `${stage}-manager.png`) });
-        page.once('dialog', d => d.accept());
+
         const closed = page.waitForResponse(r => r.url() === `${origin}/api/files/${file.id}/share` && r.request().method() === 'DELETE');
-        await row.getByRole('button', { name: '关闭', exact: true }).click();
+        await sharePanel.getByRole('button', { name: '关闭分享', exact: true }).click();
         assert.equal((await closed).status(), 200);
-        await row.waitFor({ state: 'detached' });
+        await sharePanel.getByText('已关闭',{exact:true}).waitFor();
         await publicStatus(file, 404);
         results.push(`${stage}: manager renew/revoke works, private after close`);
       }

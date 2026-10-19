@@ -1,9 +1,9 @@
 import { useEffect, useRef } from "react";
-import { LayoutDashboard, Lightbulb, LoaderCircle, SlidersHorizontal, X } from "lucide-react";
+import { BookOpenCheck, LayoutDashboard, Lightbulb, LoaderCircle, SlidersHorizontal, X } from "lucide-react";
 import { useFeatureSelection } from "./feature-selection-context";
 
 export function FeatureSelectionDialog({ onClose }: { onClose: () => void }) {
-  const { features, saving, error, changeParaBoard, changeOpportunityCards } = useFeatureSelection();
+  const { features, saving, error, changeParaBoard, changeOpportunityCards, changeJudgmentBook } = useFeatureSelection();
   const closeButton = useRef<HTMLButtonElement>(null);
   useEffect(() => {
     const previous = document.activeElement as HTMLElement | null;
@@ -28,6 +28,11 @@ export function FeatureSelectionDialog({ onClose }: { onClose: () => void }) {
           <span className="feature-selection-icon"><Lightbulb size={22} /></span>
           <span className="display-settings-card-copy"><strong>机会卡片</strong><small id="opportunity-feature-description">发现、筛选和验证新想法，保留好候选。隐藏入口会保留内容；已启用的周期任务继续运行，可在项目中暂停。</small></span>
           <input type="checkbox" aria-label="机会卡片" aria-describedby="opportunity-feature-description" checked={features.opportunityCards === true} aria-disabled={saving} aria-busy={saving} onChange={e => { if (!saving) void changeOpportunityCards(e.target.checked); }} />
+        </label>
+        <label className="feature-selection-option">
+          <span className="feature-selection-icon"><BookOpenCheck size={22}/></span>
+          <span className="display-settings-card-copy"><strong>判断簿</strong><small id="judgment-feature-description">保留预测与长期想法，按时核对和复盘。隐藏入口保留全部记录，已安排的检查继续执行。</small></span>
+          <input type="checkbox" aria-label="判断簿" aria-describedby="judgment-feature-description" checked={features.judgmentBook===true} aria-disabled={saving} aria-busy={saving} onChange={e=>{if(!saving)void changeJudgmentBook(e.target.checked);}}/>
         </label>
         <p className="feature-selection-status" role="status">{saving ? <><LoaderCircle size={14} className="spin" />正在保存…</> : "勾选后显示，取消勾选后隐藏。"}</p>
         {error && <p className="feature-selection-error" role="alert">{error}</p>}

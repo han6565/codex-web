@@ -808,8 +808,8 @@ test("personal settings expose public share management for active Markdown and H
   assert.match(appSource, /publicSharesDialogOpen/);
   assert.match(appSource, /PublicSharesDialog/);
   assert.match(dialogSource, /api\.publicShares\(\)/);
-  assert.match(dialogSource, /api\.disableFileShare\(share\.fileId\)/);
-  assert.match(dialogSource, /share\.publicUrl/);
+  assert.match(dialogSource, /FileShareDialog/);
+  assert.match(dialogSource, /管理分享/);
   assert.match(apiSource, /publicShares: \(\) => request[\s\S]*\/public-shares/);
 });
 
@@ -4013,10 +4013,10 @@ test("fixed public file sharing is private by default, owner-controlled, image-a
   const owner = request.agent(instance.app);
   const login = await owner.post("/api/auth/login").send({ username: "demo-owner", password: "fixture" }).expect(200);
   const privatePreview = await owner.get(`/api/files/${parentId}/preview`).expect(200);
-  assert.deepEqual(privatePreview.body.share, { enabled: false, expired: false, expiresAt: null, publicUrl: `https://agent.example.test/files/${parentId}/preview/public` });
+  assert.deepEqual(privatePreview.body.share, { enabled: false, expired: false, status: "private", expiresAt: null, publicUrl: `https://agent.example.test/files/${parentId}/preview/public` });
   await owner.post(`/api/files/${parentId}/share`).expect(403);
   const enabled = await owner.post(`/api/files/${parentId}/share`).set("X-CSRF-Token", login.body.csrfToken).expect(200);
-  assert.deepEqual(enabled.body.share, { enabled: true, expired: false, expiresAt: enabled.body.share.expiresAt, publicUrl: `https://agent.example.test/files/${parentId}/preview/public` });
+  assert.deepEqual(enabled.body.share, { enabled: true, expired: false, status: "active", expiresAt: enabled.body.share.expiresAt, publicUrl: `https://agent.example.test/files/${parentId}/preview/public` });
   assert.equal(instance.db.listPublicFileShareAssets(instance.db.getPublicFileShare(parentId)!.id)[0]?.asset_file_id, imageId);
   const listed = await owner.get("/api/public-shares").expect(200);
   assert.equal(listed.body.shares.length, 1);
@@ -4029,6 +4029,7 @@ test("fixed public file sharing is private by default, owner-controlled, image-a
     size: Buffer.byteLength(html),
     conversationId: conversation.id,
     conversationTitle: "public report",
+    enabled: true, presentationMode: "reader", storageState: "local",
     enabledAt: listed.body.shares[0].enabledAt,
     expiresAt: enabled.body.share.expiresAt,
     publicUrl: `https://agent.example.test/files/${parentId}/preview/public`,
@@ -4061,7 +4062,7 @@ test("fixed public file sharing is private by default, owner-controlled, image-a
   const disabled = await owner.delete(`/api/files/${parentId}/share`).set("X-CSRF-Token", login.body.csrfToken).expect(200);
   assert.equal(disabled.body.share.enabled, false);
   assert.equal(disabled.body.share.publicUrl, enabled.body.share.publicUrl);
-  assert.equal((await owner.get("/api/public-shares").expect(200)).body.shares.length, 0);
+  assert.equal((await owner.get("/api/public-shares").expect(200)).body.shares[0].enabled, false);
   assert.equal(instance.db.listPublicFileShareAssets(instance.db.getPublicFileShare(parentId)!.id).length, 0);
   await request(instance.app).get(`/api/files/${parentId}/preview/public`).expect(404);
   await request(instance.app).get(`/api/files/${parentId}/preview/public/assets/${imageId}`).expect(404);
@@ -4105,7 +4106,7 @@ test("fixed public file sharing is private by default, owner-controlled, image-a
     await request(instance.app).get(`${anonymousPath}/assets/${imageId}`).expect(404);
     await request(instance.app).head(`${anonymousPath}/assets/${imageId}`).expect(404);
     assert.deepEqual(instance.db.sqlite.prepare("SELECT count(*) AS n FROM public_share_access_events").get(), beforeVisits);
-    assert.equal((await owner.get("/api/public-shares").expect(200)).body.shares.some((item: { fileId: string }) => item.fileId === fileId), false);
+    assert.equal((await owner.get("/api/public-shares").expect(200)).body.shares.some((item: { fileId: string }) => item.fileId === fileId), true);
     const expired = (await owner.get(`/api/files/${fileId}/preview`).expect(200)).body.share;
     assert.equal(expired.enabled, false); assert.equal(expired.expired, true);
     const reactivated = await owner.post(`/api/files/${fileId}/share`).set("X-CSRF-Token", login.body.csrfToken).expect(200);
@@ -4174,8 +4175,8 @@ test("previewable file cards keep one eye action while PDF/EPUB primary links en
   assert.doesNotMatch(appSource, /HTML 隔离预览|Markdown 阅读/);
   assert.match(appSource, /<div className="file-preview-header-start">[\s\S]*file-preview-title"><strong>/);
   assert.doesNotMatch(appSource, /className="file-preview-title"><FileText/);
-  assert.match(appSource, /复制链接/);
-  assert.match(appSource, /关闭分享/);
+  assert.match(fs.readFileSync(path.join(process.cwd(), "src", "file-share-dialog.tsx"), "utf8"), /复制链接/);
+  assert.match(fs.readFileSync(path.join(process.cwd(), "src", "file-share-dialog.tsx"), "utf8"), /关闭分享/);
   assert.match(appSource, /function ReaderSettingsMenu/);
   assert.match(appSource, /<details ref=\{menu\} className="file-reader-settings-menu">/);
   assert.match(appSource, /<summary className="file-reader-settings-button"/);
@@ -4184,10 +4185,11 @@ test("previewable file cards keep one eye action while PDF/EPUB primary links en
   assert.match(appSource, /浅色/);
   assert.match(appSource, /深色/);
   assert.match(appSource, /跟随系统|系统/);
-  assert.match(appSource, /return open \? createPortal\(<div className="file-share-backdrop"/);
-  assert.match(appSource, /role="dialog" aria-modal="true" aria-labelledby="file-share-dialog-title"/);
-  assert.match(appSource, /event\.target === event\.currentTarget\) closeDialog\(\)/);
-  assert.match(appSource, /aria-label="关闭分享设置" onClick=\{closeDialog\}/);
+  const shareDialogSource = fs.readFileSync(path.join(process.cwd(), "src", "file-share-dialog.tsx"), "utf8");
+  assert.match(shareDialogSource, /return createPortal\(<div className="file-share-backdrop"/);
+  assert.match(shareDialogSource, /role="dialog" aria-modal="true" aria-labelledby="file-share-dialog-title"/);
+  assert.match(shareDialogSource, /event\.target === event\.currentTarget && !busy/);
+  assert.match(shareDialogSource, /aria-label="关闭分享设置" disabled=\{busy\} onClick=\{onClose\}/);
   assert.doesNotMatch(appSource, /访问记录/);
   assert.doesNotMatch(readerAskSource, /nativeSelection\.removeAllRanges|nativeSelection\.addRange/);
   assert.match(readerAskSource, /window\.addEventListener\("pointerup", handleSelectionEnd, \{ passive: true \}\)/);

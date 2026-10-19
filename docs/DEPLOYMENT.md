@@ -186,3 +186,7 @@ not need provider credentials merely to upgrade.
 ### Opportunity navigation and learning upgrade
 
 The optional opportunity-card increment requires no new environment variables or services. Back up your own database/state, then follow the existing immutable build/deploy commands. Startup migrations add topic ordering, learning cursors/history and project-relative knowledge entries without importing topics or schedules. See [opportunity upgrade and migration](OPPORTUNITY_CARDS.md#upgrade-and-migration) for verification and rollback boundaries. Configure your own Markdown knowledge entry and provider only if needed; keep empty/fail-closed defaults otherwise.
+
+## Upgrading current features
+
+Follow [the upgrade checklist](UPGRADE_20261020.md) for the additive presentation, judgment and background-feedback migrations. The default Docker runtime/documents split, build helper, dependency locks, login method and environment settings are unchanged. New capabilities use existing data/tenant storage and queues; do not introduce extra services or mount a host filesystem for the base installation.

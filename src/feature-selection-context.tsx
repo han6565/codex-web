@@ -9,6 +9,7 @@ const FeatureSelectionContext = createContext({
   applyFeatures: (_value: FeatureSelection) => {},
   changeParaBoard: async (_enabled: boolean) => {},
   changeOpportunityCards: async (_enabled: boolean) => {},
+  changeJudgmentBook: async (_enabled: boolean) => {},
 });
 
 async function boundedRequest<T>(run: (signal: AbortSignal) => Promise<T>, parent?: AbortSignal): Promise<T> {
@@ -74,6 +75,7 @@ export function FeatureSelectionProvider({ initial, children }: { initial?: Feat
     } finally { savingRef.current = false; setSaving(false); }
   };
   const changeParaBoard = (paraBoard: boolean) => change({ paraBoard });
+  const changeJudgmentBook = (judgmentBook: boolean) => change({ judgmentBook });
   const changeOpportunityCards = (opportunityCards: boolean) => change({ opportunityCards });
-  return <FeatureSelectionContext.Provider value={{ features, saving, error, applyFeatures, changeParaBoard, changeOpportunityCards }}>{children}</FeatureSelectionContext.Provider>;
+  return <FeatureSelectionContext.Provider value={{ features, saving, error, applyFeatures, changeParaBoard, changeOpportunityCards, changeJudgmentBook }}>{children}</FeatureSelectionContext.Provider>;
 }

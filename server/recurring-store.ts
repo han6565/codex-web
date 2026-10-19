@@ -1,3 +1,4 @@
+import { judgmentCheckBeforeFire } from "./judgment-schema.js";
 import { reserveOpportunityBatch, reconcileOpportunityBatches } from "./opportunity-schema.js";
 import { opportunityLearningPrompt } from './opportunity-learning-prompt.js';
 import crypto from "node:crypto";
@@ -32,7 +33,7 @@ export class RecurringConflict extends Error {}
 export class RecurringStore {
   constructor(readonly db: AppDatabase) {}
   private row(user: string, id: string): Row | undefined { return this.db.sqlite.prepare(`SELECT t.* FROM recurring_tasks t JOIN projects p ON p.id=t.project_id WHERE t.id=? AND t.user_id=? AND t.deleted_at IS NULL AND p.archived_at IS NULL`).get(id, user) as Row | undefined; }
-  get(user: string, id: string) { const r = this.row(user, id); return r ? { ...view(r), opportunityTopic: this.db.sqlite.prepare("SELECT id,name FROM opportunity_topics WHERE task_id=? AND user_id=? AND deleted_at IS NULL").get(id,user) as { id: string; name: string } | undefined ?? null } : undefined; }
+  get(user: string, id: string) { const r = this.row(user, id); return r ? { ...view(r), judgment: this.db.sqlite.prepare("SELECT j.id,j.title FROM judgment_checks c JOIN judgments j ON j.id=c.judgment_id WHERE c.task_id=? AND j.user_id=?").get(id,user) as {id:string;title:string}|undefined ?? null, opportunityTopic: this.db.sqlite.prepare("SELECT id,name FROM opportunity_topics WHERE task_id=? AND user_id=? AND deleted_at IS NULL").get(id,user) as { id: string; name: string } | undefined ?? null } : undefined; }
   list(user: string) { return (this.db.sqlite.prepare(`SELECT t.* FROM recurring_tasks t JOIN projects p ON p.id=t.project_id WHERE t.user_id=? AND t.deleted_at IS NULL AND p.archived_at IS NULL ORDER BY t.created_at,t.id`).all(user) as Row[]).map(view); }
   create(user: string, project: string, input: RecurringInput, now = Date.now()) {
     if (!this.db.getActiveProjectForUser(project, user)) throw new Error("项目不存在。");
@@ -67,7 +68,7 @@ export class RecurringStore {
   runs(user: string, id: string): RecurringRun[] {
     if (!this.get(user, id)) return [];
     return this.db.sqlite.prepare(`SELECT r.id,r.scheduled_at,r.created_at,r.conversation_id,r.reason,
-      CASE WHEN r.outcome='skipped' THEN 'skipped' WHEN c.deleted_at IS NOT NULL OR c.id IS NULL THEN 'deleted'
+      CASE WHEN r.outcome='feedback' THEN 'feedback' WHEN r.outcome='skipped' THEN 'skipped' WHEN c.deleted_at IS NOT NULL OR c.id IS NULL THEN 'deleted'
       WHEN EXISTS(SELECT 1 FROM pending_prompts p WHERE p.conversation_id=c.id AND p.status='queued') THEN 'queued'
       WHEN EXISTS(SELECT 1 FROM jobs j WHERE j.conversation_id=c.id AND j.status IN ('queued','running')) THEN 'running'
       ELSE COALESCE((SELECT status FROM jobs j WHERE j.conversation_id=c.id ORDER BY created_at DESC,id DESC LIMIT 1),'cancelled') END AS status
@@ -80,6 +81,12 @@ export class RecurringStore {
     try {
       const t = this.get(user, id), time = new Date(now).toISOString();
       if (!t || t.state !== "active" || !t.nextRunAt || t.nextRunAt > time) { sql.exec("COMMIT"); return null; }
+      const judgmentAction = judgmentCheckBeforeFire(sql, id, time);
+      if (judgmentAction === 'blocked' || judgmentAction === 'feedback') {
+        if (judgmentAction === 'feedback') sql.prepare(`INSERT INTO recurring_runs(id,task_id,scheduled_at,outcome,reason,created_at) VALUES(?,?,?,'feedback','等待本人反馈，无需启动模型',?)`).run(crypto.randomUUID(),id,t.nextRunAt,time);
+        sql.prepare("UPDATE recurring_tasks SET state='completed',next_run_at=NULL,run_count=run_count+?,revision=revision+1 WHERE id=?").run(judgmentAction === 'feedback' ? 1 : 0,id);
+        sql.exec('COMMIT'); return null;
+      }
       const opportunity = sql.prepare("SELECT id,knowledge_path,archived_at,deleted_at FROM opportunity_topics WHERE task_id=?").get(id) as { id: string; knowledge_path: string; archived_at: string | null; deleted_at: string | null } | undefined;
       if (opportunity) {
         const project = this.db.getActiveProjectForUser(t.project_id, user);
@@ -105,12 +112,13 @@ export class RecurringStore {
         conversationId = crypto.randomUUID(); pendingId = crypto.randomUUID();
         const stamp = new Intl.DateTimeFormat("zh-CN", { timeZone: t.schedule.timeZone, month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).format(new Date(t.nextRunAt));
         this.db.createConversation(conversationId, `${t.name} · ${stamp}`, selection, user, t.project_id);
+        if (judgmentAction === "agent") sql.prepare("UPDATE judgment_checks SET conversation_id=? WHERE task_id=?").run(conversationId,id);
         sql.prepare("UPDATE conversations SET title_source='manual' WHERE id=?").run(conversationId);
         this.db.createPendingPrompt(pendingId, conversationId, t.prompt + (opportunity ? '\n\n' + opportunityLearningPrompt(opportunity.id, opportunity.knowledge_path) : ""), selection);
         if (opportunity) reserveOpportunityBatch(sql,opportunity.id,user,conversationId,t.project_id,t.id,opportunityDay,time);
       }
       sql.prepare(`INSERT INTO recurring_runs(id,task_id,scheduled_at,conversation_id,pending_prompt_id,outcome,reason,created_at) VALUES(?,?,?,?,?,?,?,?)`).run(crypto.randomUUID(), id, t.nextRunAt, conversationId, pendingId, busy ? "skipped" : "created", busy ? (topicBusy ? "关联主题今日已处理或仍在运行，已跳过重复执行" : "上一轮仍在运行或等待，已跳过本次") : null, time);
-      const count = t.runCount + (busy ? 0 : 1), complete = t.maxRuns !== null && count >= t.maxRuns;
+      const count = t.runCount + (busy ? 0 : 1), complete = t.schedule.kind === "once" || (t.maxRuns !== null && count >= t.maxRuns);
       sql.prepare(`UPDATE recurring_tasks SET run_count=?,state=?,next_run_at=?,revision=revision+1,updated_at=? WHERE id=?`).run(count, complete ? "completed" : "active", complete ? null : nextOccurrence(t.schedule, now, Date.parse(t.nextRunAt)), time, id);
       sql.exec("COMMIT"); return conversationId;
     } catch (error) { sql.exec("ROLLBACK"); throw error; }

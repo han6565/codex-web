@@ -20,7 +20,13 @@ export function isModelCapacityError(error: unknown): boolean {
   return /selected model is at capacity|model (?:is )?at capacity/i.test(upstreamErrorMessage(error));
 }
 
+/** A provider routing failure, not a missing local project directory. */
+export function isUpstreamRoutingError(error: unknown): boolean {
+  return /\bworkspace routing discovery failed\b/i.test(upstreamErrorMessage(error));
+}
+
 export function isRetryableUpstreamError(error: unknown): boolean {
+  if (isUpstreamRoutingError(error)) return true;
   const message = upstreamErrorMessage(error).toLowerCase();
   return [
     /stream disconnected before completion/,
@@ -42,6 +48,7 @@ export function isRetryableUpstreamError(error: unknown): boolean {
  * interruption and must not be rewritten as one in the final job status.
  */
 export function isConnectionInterruptionError(error: unknown): boolean {
+  if (isUpstreamRoutingError(error)) return true;
   const message = upstreamErrorMessage(error).toLowerCase();
   return [
     /stream disconnected before completion/,

@@ -1,3 +1,4 @@
+import { ExtensionGroup } from './extensions-sidebar';
 import { useCallback, useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
 import { createPortal } from 'react-dom';
 import { Archive, GripVertical, Lightbulb, LoaderCircle, MoreHorizontal, Pencil, Plus, RotateCcw } from 'lucide-react';
@@ -111,9 +112,9 @@ export function OpportunitySidebar({ selected, query, onOpen, onCreate }: {
     if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
     if (current.target && current.placement) void move(current.source, current.target, current.placement);
   }
-  function openMenu(topic: OpportunityTopic, button: HTMLButtonElement) {
+  function openMenu(topic: Pick<OpportunityTopic, 'id'>, button: HTMLButtonElement) {
     const anchor = button.getBoundingClientRect(); trigger.current = button;
-    setMenu(menu?.id === topic.id ? null : { id: topic.id, top: Math.max(8, Math.min(anchor.bottom + 5, window.innerHeight - 112)), left: Math.max(8, Math.min(anchor.right - 176, window.innerWidth - 184)), anchorTop: anchor.top });
+    setMenu(menu?.id === topic.id ? null : { id: topic.id, top: Math.max(8, Math.min(anchor.bottom + 5, window.innerHeight - (topic.id === 'section' ? 160 : 112))), left: Math.max(8, Math.min(anchor.right - 176, window.innerWidth - 184)), anchorTop: anchor.top });
   }
   useEffect(() => {
     if (!menu) return;
@@ -135,8 +136,7 @@ export function OpportunitySidebar({ selected, query, onOpen, onCreate }: {
   }, [menu]);
   const menuTopic = shown.find(t => t.id === menu?.id);
   function showAction(topic: OpportunityTopic, mode: TopicAction['mode']) { trigger.current?.focus(); setMenu(null); setAction({ topic, mode }); }
-  return <section className="para-sidebar opportunity-sidebar" aria-label="机会卡片主题">
-    <div className="section-label project-label"><span>机会卡片</span><button type="button" onClick={onCreate} aria-label="新建机会主题" title="新建机会主题"><Plus size={15} /></button></div>
+  return <ExtensionGroup id="opportunities" label="机会卡片" icon={<Lightbulb size={17}/>} onMenu={button => openMenu({id: 'section'}, button)} menuOpen={menu?.id === 'section'}>
     {loading && <div className="list-loading" role="status"><LoaderCircle size={14} className="spin" /><span>正在读取主题…</span></div>}
     {shown.map(topic => <div key={topic.id} className={`project-row opportunity-topic-row ${selected === topic.id ? 'active' : ''} ${menu?.id === topic.id ? 'menu-open' : ''} ${dragging === topic.id ? 'dragging' : ''} ${drop?.id === topic.id ? `drop-${drop.placement}` : ''}`} data-opportunity-topic={topic.id} data-sortable={sortable && !topic.archived_at}>
       <button type="button" className="touch-drag-handle opportunity-topic-grip" disabled={!sortable || Boolean(topic.archived_at)} aria-label={`拖动主题 ${topic.name}`} title={search ? '清空搜索后可拖动排序' : '拖动排序，也可用上下方向键调整'}
@@ -153,7 +153,7 @@ export function OpportunitySidebar({ selected, query, onOpen, onCreate }: {
           if (target) void move(topic.id, target.id, event.key === 'ArrowUp' ? 'before' : 'after');
         }}><GripVertical size={12} /></button>
       <button type="button" className="project-select" aria-current={selected === topic.id ? 'page' : undefined} title={`${topic.name}（${topic.pending_count}）· 待审批卡片`} aria-label={`${topic.name}，${topic.pending_count} 张待审批卡片${topic.archived_at ? '，已归档' : ''}`} onClick={() => onOpen(topic.id)}>
-        <Lightbulb size={16} /><span className="opportunity-topic-name">{topic.name}</span><span className="opportunity-topic-count" aria-hidden="true">（{topic.pending_count}）</span>{topic.archived_at && <Archive size={13} aria-label="已归档" />}
+        <span className="opportunity-topic-name">{topic.name}</span><span className="opportunity-topic-count" aria-hidden="true">（{topic.pending_count}）</span>{topic.archived_at && <Archive size={13} aria-label="已归档" />}
       </button>
       <div className="project-actions opportunity-topic-actions"><button type="button" aria-label={`主题 ${topic.name} 操作`} aria-haspopup="menu" aria-expanded={menu?.id === topic.id} title="主题操作" onClick={event => openMenu(topic, event.currentTarget)}><MoreHorizontal size={15} /></button></div>
     </div>)}
@@ -161,10 +161,10 @@ export function OpportunitySidebar({ selected, query, onOpen, onCreate }: {
     {!loading && !error && !shown.length && (search ? <div className="project-empty">没有匹配的机会主题</div> : <button className="para-sidebar-empty" onClick={onCreate}>新建第一个主题</button>)}
     <button className="para-sidebar-empty" aria-current={selected === '' ? 'page' : undefined} onClick={() => onOpen('')}>查看全部主题</button>
     {topics.some(t => t.archived_at) && <button className="para-sidebar-empty" aria-pressed={archives} onClick={() => setArchives(!archives)}>{archives ? '隐藏归档主题' : '查看归档主题'}</button>}
-    {menu && menuTopic && createPortal(<div ref={menuRef} className="project-menu-panel opportunity-topic-menu" role="menu" aria-label="主题操作" style={{ top: menu.top, left: menu.left }}>
-      <button type="button" role="menuitem" onClick={() => showAction(menuTopic, 'rename')}><Pencil size={16} /><span>改名</span></button>
-      <button type="button" role="menuitem" className={menuTopic.archived_at ? '' : 'danger'} onClick={() => showAction(menuTopic, menuTopic.archived_at ? 'restore' : 'archive')}>{menuTopic.archived_at ? <RotateCcw size={16} /> : <Archive size={16} />}<span>{menuTopic.archived_at ? '恢复主题' : '归档主题'}</span></button>
+    {menu && (menuTopic || menu.id === 'section') && createPortal(<div ref={menuRef} className="project-menu-panel opportunity-topic-menu" role="menu" aria-label="主题操作" style={{ top: menu.top, left: menu.left }}>
+      {menuTopic ? <><button type="button" role="menuitem" onClick={() => showAction(menuTopic, 'rename')}><Pencil size={16} /><span>改名</span></button>
+      <button type="button" role="menuitem" className={menuTopic.archived_at ? '' : 'danger'} onClick={() => showAction(menuTopic, menuTopic.archived_at ? 'restore' : 'archive')}>{menuTopic.archived_at ? <RotateCcw size={16} /> : <Archive size={16} />}<span>{menuTopic.archived_at ? '恢复主题' : '归档主题'}</span></button></> : <><button role="menuitem" onClick={() => {setMenu(null); onCreate();}}><Plus size={16}/><span>新建机会主题</span></button><button role="menuitem" onClick={() => {setMenu(null); onOpen('');}}><Lightbulb size={16}/><span>查看全部主题</span></button><button role="menuitem" onClick={() => {setMenu(null); setArchives(!archives);}}><Archive size={16}/><span>{archives ? '隐藏归档主题' : '查看归档主题'}</span></button></>}
     </div>, document.body)}
     {action && <TopicActionDialog action={action} onClose={() => setAction(null)} onSaved={() => void refresh()} />}
-  </section>;
+  </ExtensionGroup>;
 }

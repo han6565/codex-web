@@ -1,4 +1,4 @@
-import type { RecurringInput, RecurringTask, RecurringRun } from "./recurring-types";
+import type { RecurringInput, RecurringTask, RecurringRun, Recurrence, RecurrencePreview } from "./recurring-types";
 import type { FeatureSelection } from "./feature-selection";
 export const BASE_PATH = (import.meta.env?.BASE_URL ?? "/").replace(/\/$/, "");
 
@@ -132,9 +132,9 @@ export type ProjectSkill = { name: string; description: string; enabled: boolean
 export type ProjectSkillDetail = ProjectSkill & { content: string };
 export type ConversationPage = { conversations: Conversation[]; total: number; hasMore: boolean; nextOffset: number | null };
 export type WorkFile = {
-  id: string; original_name: string; relative_path: string; source_path?: string | null; mime_type: string; size: number; kind: "upload" | "output";
+  id: string; original_name: string; relative_path: string; source_path?: string | null; presentation_mode?: "reader" | "web"; previous_file_id?: string | null; mime_type: string; size: number; kind: "upload" | "output";
 };
-export type FileShareState = { enabled: boolean; expired: boolean; expiresAt: string | null; publicUrl: string };
+export type FileShareState = { status?: "private" | "active" | "expired" | "closed"; enabled: boolean; expired: boolean; expiresAt: string | null; publicUrl: string };
 export type ManagedPublicShare = {
   id: string;
   fileId: string;
@@ -144,10 +144,14 @@ export type ManagedPublicShare = {
   size: number;
   conversationId: string;
   conversationTitle: string;
+  enabled: boolean;
+  presentationMode: "reader" | "web";
+  storageState: string;
   enabledAt: string | null;
   expiresAt: string;
   publicUrl: string;
 };
+export type FileShareMetadata = { file: Pick<WorkFile, "id" | "original_name" | "mime_type" | "size" | "kind" | "presentation_mode" | "previous_file_id">; share: FileShareState; conversationId: string; storageState: string };
 export type FilePreviewConversation = Pick<Conversation, "id" | "title" | "status" | "external_status" | "has_unread_result" | "has_pending_work">;
 export type FilePreviewMetadata = { file: WorkFile; share: FileShareState; conversation: FilePreviewConversation };
 export type ReaderFormat = "markdown" | "html" | "pdf" | "epub";
@@ -163,8 +167,8 @@ export type ReaderUnitResponse = { unit: { id: string; ordinal: number; href: st
 export type ReaderProgress = { user_id: string; version_id: string; unit_id: string | null; position_json: string; updated_at: string };
 export type ReaderAnnotation = { id: string; user_id: string; version_id: string; unit_id: string | null; type: "highlight" | "note"; quote_text: string; note_text: string | null; color: string; locator_json: string; created_at: string; updated_at: string; deleted_at: string | null };
 export type PublicFilePreview = {
-  file: Pick<WorkFile, "id" | "original_name" | "mime_type" | "size" | "kind">;
-  content: string;
+  file: Pick<WorkFile, "id" | "original_name" | "mime_type" | "size" | "kind" | "presentation_mode">;
+  content: string | null;
 };
 export type Message = {
   id: string; role: "user" | "assistant" | "system"; content: string; quote_excerpt: string | null; is_scheduled?: number; attachment_references: string[]; created_at: string; files: WorkFile[];
@@ -525,6 +529,7 @@ export async function request<T>(path: string, init: RequestInit = {}, options: 
 export const api = {
   setRecurringState: (id: string, revision: number, state: "active" | "paused") => request<{ task: RecurringTask }>(`/recurring-tasks/${encodeURIComponent(id)}/state`, { method: "POST", body: JSON.stringify({ revision, state }) }),
   projectScheduledWaits: (id: string) => request<{ waits: Array<{ id: string; label: string; deadline_at: string; conversation_id: string }> }>(`/projects/${encodeURIComponent(id)}/scheduled-waits`),
+  previewRecurrence: (schedule: Recurrence) => request<RecurrencePreview>("/recurring-tasks/preview", { method: "POST", body: JSON.stringify({ schedule }) }),
   recurringTasks: () => request<{ tasks: RecurringTask[] }>("/recurring-tasks"),
   recurringTask: (id: string) => request<{ task: RecurringTask; runs: RecurringRun[] }>(`/recurring-tasks/${encodeURIComponent(id)}`),
   createRecurringTask: (projectId: string, input: RecurringInput) => request<{ task: RecurringTask }>(`/projects/${encodeURIComponent(projectId)}/recurring-tasks`, { method: "POST", body: JSON.stringify(input) }),
@@ -570,6 +575,7 @@ export const api = {
   ),
   renameProject: (id: string, name: string) => request<{ project: Project }>(`/projects/${id}`, { method: "PATCH", body: JSON.stringify({ name }) }),
   archiveProject: (id: string) => request<{ project: Project }>(`/projects/${id}/archive`, { method: "POST" }),
+  markProjectSeen: (id: string) => request<{ updatedCount: number }>(`/projects/${id}/seen`, { method: "POST" }),
   reorderProjects: (projectIds: string[]) => request<{ ok: true }>("/projects/order", { method: "PUT", body: JSON.stringify({ projectIds }) }),
   updateProjectSidebarCollapsed: (id: string, collapsed: boolean) => request<{ project: Project }>(`/projects/${id}/sidebar-collapsed`, {
     method: "PUT", body: JSON.stringify({ collapsed }),
@@ -831,6 +837,18 @@ export const api = {
     `/reader/annotations/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(input) },
   ),
   deleteReaderAnnotation: (id: string) => request<void>(`/reader/annotations/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  fileShare: (id: string) => request<FileShareMetadata>(`/files/${encodeURIComponent(id)}/share`),
+  restoreSharedFile: (id: string) => request<FileShareMetadata & { restoring: boolean }>(`/files/${encodeURIComponent(id)}/restore`, { method: "POST" }, { allowStatuses: [202] }),
+  redeliverPresentation: (id: string, presentation_mode: "reader" | "web") => request<FileShareMetadata>(`/files/${encodeURIComponent(id)}/presentation-version`, { method: "POST", body: JSON.stringify({ presentation_mode }) }),
+  webSession: async (id: string, publicView: boolean, signal?: AbortSignal): Promise<{ title: string; ticket: string; src: string }> => {
+    for (let attempt = 0; attempt < 180; attempt++) {
+      const result = await request<{ title?: string; ticket?: string; src?: string; restoring?: boolean }>(`/files/${encodeURIComponent(id)}/web-session${publicView ? "/public" : ""}`, { signal }, { allowStatuses: [202] });
+      if (result.ticket && result.src) return { title: result.title || "交互网页", ticket: result.ticket, src: result.src };
+      if (!result.restoring || publicView) throw new Error("网页版本不可用。");
+      await waitForReaderRetry(signal, 1000);
+    }
+    throw new Error("仍在从阿里云盘恢复，请稍后重新打开。");
+  },
   enableFileShare: (id: string) => request<{ share: FileShareState }>(
     `/files/${encodeURIComponent(id)}/share`, { method: "POST" },
   ),

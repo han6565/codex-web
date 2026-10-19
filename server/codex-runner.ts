@@ -14,7 +14,7 @@ import { TenantWorkerClient } from "./tenant-worker-client.js";
 import type { TenantWorkerEvent, TenantWorkerRunRequest } from "./tenant-worker-protocol.js";
 import type { AppServerTurnExecution } from "./app-server-turn.js";
 import type { CodexQuotaUsage, ContextTokenUsage } from "./app-server-turn.js";
-import { modelCapacityRetryDelayMs, isConnectionInterruptionError, isModelCapacityError, isRetryableUpstreamError, runWithTransientRetries } from "./retry-policy.js";
+import { modelCapacityRetryDelayMs, isConnectionInterruptionError, isModelCapacityError, isRetryableUpstreamError, isUpstreamRoutingError, runWithTransientRetries } from "./retry-policy.js";
 import { isHostRootUser } from "./host-root-user.js";
 import { HostRootWorkerClient } from "./host-root-worker-client.js";
 import type { HostRootRunRequest } from "./host-root-protocol.js";
@@ -29,10 +29,11 @@ import { HOST_EXECUTOR_ID, workerIdFromExecutor } from "./remote-worker-protocol
 import { TENANT_LOCAL_EXECUTOR_ID, assertTenantProjectRoot, createTenantProjectDirectory, initializeTenantProjectDirectory, listTenantProjectDirectories, validateTenantProjectDirectory } from "./tenant-projects.js";
 import { CODEX_EGRESS_FALLBACK_NOTICE, selectCodexEgress } from "./codex-egress.js";
 import { appendWaitAutomationInstructions, createJobAutomationToken } from "./wake-automation.js";
-import { cleanupFinalizationDirectory, prepareFinalizationFiles, recoverPreparedFinalization, rollbackUncommittedFinalization, sweepFinalizationOrphans, type FinalizationFileSource } from "./job-finalization.js";
+import { cleanupFinalizationDirectory, prepareJobFinalization, recoverPreparedFinalization, rollbackUncommittedFinalization, sweepFinalizationOrphans, type FinalizationFileSource } from "./job-finalization.js";
 import { cleanupOwnedStagingDirectory } from "./owned-staging.js";
-import { MODEL_CAPACITY_CONTINUATION_PROMPT } from "./internal-messages.js";
+import { MODEL_CAPACITY_CONTINUATION_PROMPT, UPSTREAM_ROUTING_CONTINUATION_PROMPT } from "./internal-messages.js";
 import { withTaskRecoveryPrompt } from "./task-recovery.js";
+import { SqliteJobEventQueue, retrySqliteWrite } from "./sqlite-job-events.js";
 
 export { MODEL_CAPACITY_CONTINUATION_PROMPT, isModelCapacityContinuationPrompt } from "./internal-messages.js";
 
@@ -59,8 +60,10 @@ export function retryDelayLabel(delayMs: number): string {
   return `${delayMs / 60_000} 分钟`;
 }
 
-export function capacityRetryPrompt(originalPrompt: string, continuationRequired: boolean): string {
-  return continuationRequired ? MODEL_CAPACITY_CONTINUATION_PROMPT : originalPrompt;
+export function capacityRetryPrompt(originalPrompt: string, continuationRequired: boolean, kind?: JobAttemptState["retryKind"]): string {
+  return continuationRequired
+    ? kind === "routing" ? UPSTREAM_ROUTING_CONTINUATION_PROMPT : MODEL_CAPACITY_CONTINUATION_PROMPT
+    : originalPrompt;
 }
 
 export function isAlreadyAbsentRemoteThread(error: unknown, threadId: string): boolean {
@@ -139,10 +142,19 @@ export class CodexRunner {
     return this.abortControllers.size;
   }
 
-  async recoverJobFinalizations(): Promise<{ resumed: number; rolledBack: number; published: number; orphaned: number; errors: string[] }> {
+  private async publishJobResult(jobId: string, recovered = false): Promise<void> {
+    await retrySqliteWrite(this.db.sqlite, () => {
+      if (!this.db.hasJobEvent(jobId, "done")) this.publish(jobId, "done", { status: "completed", ...(recovered ? { recovered: true } : {}) });
+    });
+    await retrySqliteWrite(this.db.sqlite, () => this.db.publishJobFinalization(jobId));
+  }
+
+  async recoverJobFinalizations(options: { committedOnly?: boolean } = {}): Promise<{ resumed: number; rolledBack: number; published: number; orphaned: number; errors: string[] }> {
     const report = { resumed: 0, rolledBack: 0, published: 0, orphaned: 0, errors: [] as string[] };
     const recoverable = this.db.listRecoverableJobFinalizations();
     for (const job of recoverable) {
+      if (this.abortControllers.has(job.id)) continue;
+      if (options.committedOnly && (job.status !== "completed" || job.finalization_state !== "db_committed")) continue;
       try {
         const payload = parseFinalizationPayload(job.finalization_payload);
         if (!payload || payload.message.conversation_id !== job.conversation_id) throw new Error("Invalid persisted finalization payload");
@@ -151,27 +163,27 @@ export class CodexRunner {
           const recovered = await recoverPreparedFinalization(this.config.dataRoot, job.id, payload);
           if (!recovered) {
             await rollbackUncommittedFinalization(this.config.dataRoot, job.id, payload);
-            this.db.abandonJobFinalization(job.id, "Incomplete staging was rolled back during startup recovery");
+            await retrySqliteWrite(this.db.sqlite, () => this.db.abandonJobFinalization(job.id, "Incomplete staging was rolled back during startup recovery"));
             report.rolledBack += 1;
             continue;
           }
           ready = recovered;
-          this.db.markJobFilesReady(job.id, ready);
+          await retrySqliteWrite(this.db.sqlite, () => this.db.markJobFilesReady(job.id, ready));
         }
         if (["staging", "files_ready"].includes(job.finalization_state)) {
-          this.db.finalizeJob(job.id, job.conversation_id, ready);
+          await retrySqliteWrite(this.db.sqlite, () => this.db.finalizeJob(job.id, job.conversation_id, ready));
           report.resumed += 1;
         }
-        if (!this.db.hasJobEvent(job.id, "done")) this.publish(job.id, "done", { status: "completed", recovered: true });
-        this.db.publishJobFinalization(job.id);
+        await this.publishJobResult(job.id, true);
         await cleanupFinalizationDirectory(this.config.dataRoot, job.id);
         report.published += 1;
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        this.db.failJobFinalization(job.id, message);
+        await retrySqliteWrite(this.db.sqlite, () => this.db.failJobFinalization(job.id, message)).catch(() => undefined);
         report.errors.push(`${job.id}: ${message}`);
       }
     }
+    if (options.committedOnly) return report;
     const protectedIds = new Set([
       ...this.db.listRecoverableJobFinalizations().map((job) => job.id),
       ...this.db.listRunningJobSummaries().map((job) => job.id),
@@ -475,6 +487,21 @@ export class CodexRunner {
 
   async run(jobId: string, conversationId: string, prompt: string, uploads: FileRow[], selection: AgentSelection, options: { resumeRemote?: boolean } = {}): Promise<void> {
     const controller = new AbortController();
+    const eventQueue = new SqliteJobEventQueue(this.db.sqlite, { onFailure: (error) => {
+      const cause = error.cause as { code?: unknown; errcode?: unknown } | undefined;
+      console.error("Job callback persistence failed", { jobId, name: error.name, code: cause?.code, errcode: cause?.errcode });
+      // Stop only this execution. Do not mark this as a user cancellation or
+      // transparently start the turn again after commands have already run.
+      for (const stop of [
+        () => this.directExecutions.get(jobId)?.interrupt(),
+        () => this.workerClient?.cancel(jobId),
+        () => this.hostWorkerClient.cancel(jobId),
+        () => this.remoteWorkers.cancel(jobId),
+      ]) {
+        try { stop(); } catch { /* Keep trying the execution's other transports. */ }
+      }
+    } });
+    controller.signal.addEventListener("abort", () => eventQueue.close(), { once: true });
     let runtimeRoot: string | undefined;
     let remoteArtifacts: StoredArtifact[] = [];
     let remoteOmittedArtifacts: NonNullable<Extract<TenantWorkerEvent, { type: "completed" }>["omittedArtifacts"]> = [];
@@ -539,6 +566,7 @@ export class CodexRunner {
       const attachments = this.attachmentContext(uploads, workspace, agentWorkspace, hostRoot);
       const imageInputDecision = decideImageInput(attachments);
       const baseEffectivePrompt = buildAgentTurnPrompt({
+        managedWebDelivery: Boolean(remoteWorkerId),
         userPrompt: recoveredPrompt + paraJobPrompt(this.db.sqlite, jobId),
         attachments,
         personalContext,
@@ -554,7 +582,8 @@ export class CodexRunner {
       const legacyWaitInstructions = Boolean(automation && remoteWorkerId && !remoteDynamicWait && !conversation.codex_thread_id);
       const effectivePrompt = appendWaitAutomationInstructions(baseEffectivePrompt, legacyWaitInstructions);
       const continuationEffectivePrompt = buildAgentTurnPrompt({
-        userPrompt: withTaskRecoveryPrompt(MODEL_CAPACITY_CONTINUATION_PROMPT, recoveryCheckpoint, true),
+        managedWebDelivery: Boolean(remoteWorkerId),
+        userPrompt: withTaskRecoveryPrompt(capacityRetryPrompt(prompt, true, attemptState.retryKind), recoveryCheckpoint, true),
         attachments: [],
         personalContext,
         runtimeWarning: !hostRoot && !pythonRuntime.ready
@@ -607,7 +636,7 @@ export class CodexRunner {
         automation,
       };
       let remoteThreadId = conversation.codex_thread_id;
-      const callbacks = {
+      const persistenceCallbacks = {
         onThreadStarted: (threadId: string) => {
           // Synchronizing the thread prevents accidental duplicate thread creation. It does
           // not make a started turn or its external side effects safe to replay.
@@ -658,6 +687,24 @@ export class CodexRunner {
           this.publish(jobId, "progress", payload);
         },
       };
+      const callbacks = {
+        onThreadStarted: (threadId: string) => {
+          executionObserved = true;
+          eventQueue.enqueue(() => persistenceCallbacks.onThreadStarted(threadId), threadId);
+        },
+        onContextUsage: (usage: ContextTokenUsage) => {
+          executionObserved = true;
+          eventQueue.enqueue(() => persistenceCallbacks.onContextUsage(usage), usage);
+        },
+        onQuotaUsage: (usage: CodexQuotaUsage) => {
+          executionObserved = true;
+          eventQueue.enqueue(() => persistenceCallbacks.onQuotaUsage(usage), usage);
+        },
+        onProgress: (payload: unknown) => {
+          executionObserved = true;
+          eventQueue.enqueue(() => persistenceCallbacks.onProgress(payload), payload);
+        },
+      };
       if (!remoteWorkerId) {
         const codexEgress = await selectCodexEgress({ signal: controller.signal });
         request.codexEgressKind = codexEgress.kind;
@@ -673,7 +720,7 @@ export class CodexRunner {
       const rawFinalResponse = await runWithTransientRetries(async (retryAttempt) => {
         capacityAttemptHadProgress = false;
         const continuationAttempt = capacityContinuationRequired;
-        const attemptUserPrompt = withTaskRecoveryPrompt(capacityRetryPrompt(prompt, continuationAttempt), recoveryCheckpoint, continuationAttempt);
+        const attemptUserPrompt = withTaskRecoveryPrompt(capacityRetryPrompt(prompt, continuationAttempt, attemptState?.retryKind), recoveryCheckpoint, continuationAttempt);
         const attemptEffectivePrompt = continuationAttempt ? continuationEffectivePrompt : effectivePrompt;
         const attemptRemotePrompt = appendPersonalContextToUserPrompt(attemptUserPrompt + (continuationAttempt ? "" : paraJobPrompt(this.db.sqlite, jobId)), personalContext);
         const attemptUploads = continuationAttempt ? [] : uploads;
@@ -687,9 +734,9 @@ export class CodexRunner {
           this.publish(jobId, "progress", { kind: "retry", label: `正在进行第 ${retryAttempt} 次连接重试` });
         }
         if (remoteWorkerId && project) {
-          const result = options.resumeRemote
-            ? await this.remoteWorkers.resume(jobId, remoteWorkerId, callbacks)
-            : await this.remoteWorkers.run(remoteWorkerId, {
+          const result = await eventQueue.waitFor(options.resumeRemote
+            ? this.remoteWorkers.resume(jobId, remoteWorkerId, callbacks)
+            : this.remoteWorkers.run(remoteWorkerId, {
             jobId,
             conversationId,
             projectRoot: project.root_path,
@@ -709,22 +756,22 @@ export class CodexRunner {
                 imageInput: !continuationAttempt && imageInputDecision.preload ? "preload" as const : "none" as const,
               },
             } : {}),
-          }, attemptUploads.map((row) => ({ row, absolutePath: resolveInside(workspace, row.relative_path) })), callbacks);
+          }, attemptUploads.map((row) => ({ row, absolutePath: resolveInside(workspace, row.relative_path) })), callbacks));
           remoteArtifacts = result.artifacts;
           remoteOmittedArtifacts = result.omittedArtifacts;
           return result.finalResponse;
         }
-        if (hostRoot) return this.hostWorkerClient.run(hostRequest, callbacks);
-        if (this.workerClient) return this.workerClient.run(request, callbacks);
+        if (hostRoot) return eventQueue.waitFor(this.hostWorkerClient.run(hostRequest, callbacks));
+        if (this.workerClient) return eventQueue.waitFor(this.workerClient.run(request, callbacks));
         const execution = startTenantTurn(request, { signal: controller.signal, ...callbacks });
         this.directExecutions.set(jobId, execution);
-        try { return await execution.result; }
+        try { return await eventQueue.waitFor(execution.result); }
         finally { if (this.directExecutions.get(jobId) === execution) this.directExecutions.delete(jobId); }
       }, {
         signal: controller.signal,
         // Capacity waits are persisted and release the worker. Only pre-execution
         // transport failures may retry inside this invocation.
-        canRetry: (error) => !isModelCapacityError(error) && !executionObserved,
+        canRetry: (error) => !isModelCapacityError(error) && !executionObserved && !isUpstreamRoutingError(error),
         onRetry: ({ attempt, maxAttempts, delayMs }) => {
           this.publish(jobId, "status", { status: "retrying", label: "上游连接短暂中断，正在自动重试",
             retryAttempt: attempt, retryMaxAttempts: maxAttempts, retryDelaySeconds: delayMs / 1000,
@@ -732,7 +779,8 @@ export class CodexRunner {
         },
       });
 
-      this.publish(jobId, "status", { status: "running", label: "正在校验并原子登记结果" });
+      controller.signal.throwIfAborted();
+      await retrySqliteWrite(this.db.sqlite, () => this.publish(jobId, "status", { status: "running", label: "正在校验并原子登记结果" }));
       const messageId = newId();
       const createdAt = new Date().toISOString();
       const finalResponse = stripPersonalContext(
@@ -820,41 +868,57 @@ export class CodexRunner {
           }
         }
       }
-      const stagedPayload: JobFinalizationPayload = { message, files: fileSources.map(({ row }) => row) };
-      this.db.stageJobFinalization(jobId, stagedPayload);
-      const preparedFiles = await prepareFinalizationFiles(this.config.dataRoot, jobId, fileSources);
-      const readyPayload: JobFinalizationPayload = { message, files: preparedFiles };
-      this.db.markJobFilesReady(jobId, readyPayload);
-      this.db.finalizeJob(jobId, conversationId, readyPayload);
-      if (personalContextSnapshot) {
-        this.db.setConversationPersonalContextRevision(conversationId, personalContextSnapshot.revision);
-      }
-      if (!this.db.hasJobEvent(jobId, "done")) this.publish(jobId, "done", { status: "completed" });
-      this.db.publishJobFinalization(jobId);
+      const stagedPayload: JobFinalizationPayload = { message, files: fileSources.map(({ row }) => row),
+        ...(personalContextSnapshot ? { personalContextRevision: personalContextSnapshot.revision } : {}) };
+      await retrySqliteWrite(this.db.sqlite, () => this.db.stageJobFinalization(jobId, stagedPayload));
+      const readyPayload = { ...await prepareJobFinalization(this.config.dataRoot, jobId, message, fileSources),
+        ...(personalContextSnapshot ? { personalContextRevision: personalContextSnapshot.revision } : {}) };
+      await retrySqliteWrite(this.db.sqlite, () => this.db.markJobFilesReady(jobId, readyPayload));
+      await retrySqliteWrite(this.db.sqlite, () => this.db.finalizeJob(jobId, conversationId, readyPayload));
+      await this.publishJobResult(jobId);
       if (remoteWorkerId) this.remoteWorkers.release(jobId);
       await cleanupFinalizationDirectory(this.config.dataRoot, jobId).catch((error) => {
         console.warn("Finalization staging cleanup failed", error instanceof Error ? error.message : error);
       });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : "Agent 任务失败";
-      if (!controller.signal.aborted && !reportedErrors.has(errorMessage)) {
+      const committed = this.db.getJob(jobId);
+      if (committed?.status === "completed" && ["db_committed", "published"].includes(committed.finalization_state)) {
+        // The message/files are already durable. Keep the recovery journal and
+        // retry only publication in the background, never the model or tools.
+        await retrySqliteWrite(this.db.sqlite, () => this.db.failJobFinalization(jobId, errorMessage)).catch(() => undefined);
+        console.warn("Committed Job publication deferred", { jobId, error: errorMessage });
+        this.remoteWorkers.release(jobId);
+        return;
+      }
+      const routingFailure = isUpstreamRoutingError(error);
+      if (!routingFailure && !controller.signal.aborted && !reportedErrors.has(errorMessage)) {
         try { this.publish(jobId, "progress", { kind: "error", label: errorMessage }); }
         catch { /* Preserve terminal handling if the event store is unavailable. */ }
       }
-      if (!controller.signal.aborted && isModelCapacityError(error) && attemptState) {
+      const continuationRequired = Boolean(attemptState?.continuation || attemptState?.acceptedTurnId || capacityAttemptHadProgress);
+      const canContinueRouting = !continuationRequired || Boolean(this.db.getConversation(conversationId)?.codex_thread_id);
+      if (!controller.signal.aborted && attemptState
+        && (isModelCapacityError(error) || (routingFailure && canContinueRouting))) {
         const now = Date.now();
+        attemptState.retryKind = routingFailure ? "routing" : "capacity";
         attemptState.capacityStartedAt ??= now;
         const delayMs = modelCapacityRetryDelayMs(attemptState.retries, now - attemptState.capacityStartedAt);
         attemptState.retries += 1;
         attemptState.nextAttemptAt = new Date(now + delayMs).toISOString();
-        capacityContinuationRequired = attemptState.continuation || capacityAttemptHadProgress;
+        capacityContinuationRequired = continuationRequired;
         attemptState.continuation = capacityContinuationRequired;
-        if (this.db.deferJobForCapacity(jobId, attemptState)) {
+        if (await retrySqliteWrite(this.db.sqlite, () => routingFailure
+          ? this.db.deferJobForRetry(jobId, attemptState!) : this.db.deferJobForCapacity(jobId, attemptState!))) {
           this.remoteWorkers.release(jobId);
-          this.publish(jobId, "progress", { kind: "retry", label: `容量不足，已保存进度，将在 ${retryDelayLabel(delayMs)} 后继续`,
+          this.publish(jobId, "progress", { kind: "retry", label: `${routingFailure ? "上游路由连接暂时不可用" : "容量不足"}，已保存进度，将在 ${retryDelayLabel(delayMs)} 后继续`,
             retryAttempt: attemptState.retries, retryAt: attemptState.nextAttemptAt });
           return;
         }
+      }
+      if (routingFailure && !controller.signal.aborted && !reportedErrors.has(errorMessage)) {
+        try { this.publish(jobId, "progress", { kind: "error", label: errorMessage }); }
+        catch { /* Preserve terminal handling if the event store is unavailable. */ }
       }
       const cancelled = controller.signal.aborted;
       const interrupted = !cancelled && error instanceof Error && (
@@ -867,10 +931,10 @@ export class CodexRunner {
         ? "连接在本轮开始后中断。为避免重复执行命令或外部副作用，系统没有整轮重试；请确认现场状态后再继续。"
         : error instanceof Error ? error.message : "Agent 任务失败";
       try {
-        this.db.finishJob(jobId, conversationId, cancelled ? "cancelled" : interrupted ? "interrupted" : "failed", message,
-          interrupted ? `本轮已经开始执行，但随后连接中断。为避免重复产生副作用，系统没有自动重放。\n\n${message}` : undefined);
-      } catch {
-        // Keep a single failed job from becoming an unhandled rejection that terminates the service.
+        await retrySqliteWrite(this.db.sqlite, () => this.db.finishJob(jobId, conversationId, cancelled ? "cancelled" : interrupted ? "interrupted" : "failed", message,
+          interrupted ? `本轮已经开始执行，但随后连接中断。为避免重复产生副作用，系统没有自动重放。\n\n${message}` : undefined));
+      } catch (terminalError) {
+        console.error("Job terminal state could not be persisted", { jobId, error: terminalError instanceof Error ? terminalError.message : "unknown" });
       }
       this.remoteWorkers.release(jobId);
       try {
@@ -879,6 +943,7 @@ export class CodexRunner {
         // The database may already be unavailable; the service must stay alive for recovery and diagnostics.
       }
     } finally {
+      eventQueue.close();
       this.abortControllers.delete(jobId);
       this.directExecutions.delete(jobId);
       if (runtimeRoot && this.db.getJob(jobId)?.status !== "queued") cleanupJobRuntime(runtimeRoot);
@@ -925,6 +990,7 @@ function parseFinalizationPayload(value: string | null): JobFinalizationPayload 
     const payload = JSON.parse(value) as JobFinalizationPayload;
     if (!payload || typeof payload !== "object" || !payload.message || !Array.isArray(payload.files)) return null;
     if (typeof payload.message.id !== "string" || typeof payload.message.conversation_id !== "string" || payload.message.role !== "assistant") return null;
+    if (payload.personalContextRevision !== undefined && (!Number.isSafeInteger(payload.personalContextRevision) || payload.personalContextRevision < 0)) return null;
     if (payload.files.some((file) => !file || typeof file.id !== "string" || typeof file.relative_path !== "string" || file.kind !== "output")) return null;
     return payload;
   } catch { return null; }

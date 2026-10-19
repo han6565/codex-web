@@ -1,0 +1,132 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import crypto from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import bcrypt from "bcryptjs";
+import request from "supertest";
+import { validateRecurrence, nextOccurrence, dailyNodes, previewRecurrence } from "../server/recurrence.js";
+import { recurrenceLabel } from "../src/recurring-labels.js";
+import { AppDatabase, LEGACY_USER_ID } from "../server/db.js";
+import { RecurringStore, RecurringConflict } from "../server/recurring-store.js";
+import { createApp } from "../server/app.js";
+import type { Recurrence, RecurringInput } from "../src/recurring-types.js";
+const zone = "Asia/Shanghai";
+const windows: Recurrence = { kind: "daily_windows", timeZone: zone, windows: [{ start: "10:00", end: "22:00", intervalMinutes: 360 }, { start: "22:00", end: "10:00", intervalMinutes: 120 }] };
+const nodes = ["00:00", "02:00", "04:00", "06:00", "08:00", "10:00", "16:00", "22:00"];
+const times: Recurrence = { kind: "daily_times", timeZone: zone, times: nodes };
+const start = Date.parse("2026-10-17T01:59:59Z");
+const input: RecurringInput = { name: "Intraday fixture", prompt: "Only reply OK", model: "gpt-6-sol", reasoningEffort: "medium", maxRuns: null, schedule: windows };
+
+test("adjacent overnight windows generate exact daily nodes and strictly future dates", () => {
+  assert.deepEqual(dailyNodes(validateRecurrence(windows)), nodes);
+  assert.deepEqual(dailyNodes(validateRecurrence({ ...times, times: [...nodes].reverse() })), nodes);
+  const expected = ["2026-10-17T02:00:00.000Z", "2026-10-17T08:00:00.000Z", "2026-10-17T14:00:00.000Z", "2026-10-17T16:00:00.000Z", "2026-10-17T18:00:00.000Z", "2026-10-17T20:00:00.000Z", "2026-10-17T22:00:00.000Z", "2026-10-18T00:00:00.000Z"];
+  for (const s of [windows, times]) {
+    assert.deepEqual(previewRecurrence(s, start).occurrences, expected);
+    let after = start;
+    for (const next of expected) { assert.equal(nextOccurrence(s, after), next); after = Date.parse(next); }
+    assert.equal(nextOccurrence(s, Date.parse("2026-10-17T02:00:00Z")), expected[1]);
+    assert.equal(nextOccurrence(s, Date.parse("2026-10-17T14:00:00Z")), expected[3]);
+  }
+});
+test("overnight cadence starts at window start and does not reset at midnight", () => {
+  const s = validateRecurrence({ kind: "daily_windows", timeZone: "Asia/Kathmandu", windows: [{ start: "22:45", end: "03:00", intervalMinutes: 100 }] });
+  assert.deepEqual(dailyNodes(s), ["00:25", "02:05", "22:45"]);
+  assert.equal(nextOccurrence(s, Date.parse("2026-10-17T18:39:59Z")), "2026-10-17T18:40:00.000Z");
+  assert.equal(nextOccurrence(s, Date.parse("2026-10-17T18:40:00Z")), "2026-10-17T20:20:00.000Z");
+  const gap = validateRecurrence({ kind: "daily_windows", timeZone: "UTC", windows: [{ start: "10:00", end: "10:05", intervalMinutes: 60 }] });
+  assert.deepEqual(dailyNodes(gap), ["10:00"]);
+  assert.equal(nextOccurrence(gap, Date.parse("2026-10-17T10:00:00Z")), "2026-10-18T10:00:00.000Z");
+});
+test("intraday DST gaps skip individual nodes and folds never repeat the wall-clock node", () => {
+  const s: Recurrence = { kind: "daily_times", timeZone: "America/New_York", times: ["01:30", "02:30", "03:30"] };
+  assert.equal(nextOccurrence(s, Date.parse("2026-03-08T06:30:00Z")), "2026-03-08T07:30:00.000Z");
+  assert.equal(nextOccurrence(s, Date.parse("2026-11-01T04:00:00Z")), "2026-11-01T05:30:00.000Z");
+  assert.equal(nextOccurrence(s, Date.parse("2026-11-01T05:30:00Z")), "2026-11-01T07:30:00.000Z");
+  assert.equal(nextOccurrence(s, Date.parse("2026-11-01T06:00:00Z")), "2026-11-01T07:30:00.000Z");
+  const w = validateRecurrence({ kind: "daily_windows", timeZone: s.timeZone, windows: [{ start: "01:30", end: "04:00", intervalMinutes: 60 }] });
+  assert.deepEqual(previewRecurrence(w, Date.parse("2026-11-01T04:00Z")), previewRecurrence(s, Date.parse("2026-11-01T04:00Z")));
+});
+test("invalid, excessive, duplicate and overlapping schedules fail with actionable errors", () => {
+  for (const value of [[], ["24:00"], ["9:00"], [null], ["09:00", "09:00"], new Array(97).fill("09:00")]) assert.throws(() => validateRecurrence({ ...times, times: value }), /节点/);
+  for (const value of [[], Array(9).fill(windows.windows[0]), [null], [{ start: "10:00", end: "10:00", intervalMinutes: 60 }], [{ start: "10:00", end: "22:00", intervalMinutes: 0 }], [{ start: "10:00", end: "22:00", intervalMinutes: 1.5 }], [{ start: "10:00", end: "22:00", intervalMinutes: "60" }]]) assert.throws(() => validateRecurrence({ ...windows, windows: value }), /时段/);
+  assert.throws(() => validateRecurrence({ ...windows, windows: [{ start: "22:00", end: "10:00", intervalMinutes: 120 }, { start: "09:00", end: "12:00", intervalMinutes: 120 }] }), /重叠/);
+  assert.throws(() => validateRecurrence({ ...windows, windows: [{ start: "22:00", end: "10:00", intervalMinutes: 1 }] }), /最多 96/);
+  assert.throws(() => validateRecurrence({ ...times, timeZone: "Mars" }), /时区/);
+  assert.throws(() => validateRecurrence({ ...times, times: "09:00" }), /节点/);
+});
+test("intraday labels explain all nodes and next-day windows", () => {
+  assert.equal(recurrenceLabel(times), `每天 ${nodes.join("、")}`);
+  assert.equal(recurrenceLabel(windows), "每日分时段 · 10:00–22:00 每 6 小时；22:00–次日10:00 每 2 小时");
+});
+for (const s of [times, windows]) test(`${s.kind}: persistent dispatch, overlap, recovery, pause/resume, finite runs and rollback retain existing semantics`, t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "intraday-"));
+  const db = new AppDatabase(root), store = new RecurringStore(db), user = LEGACY_USER_ID;
+  const project = db.createProject(crypto.randomUUID(), user, "fixture", root, "tenant-local");
+  const second = new AppDatabase(root, undefined, false), s2 = new RecurringStore(second);
+  t.after(() => { second.close(); db.close(); fs.rmSync(root, { recursive: true, force: true }); });
+  const body = { ...input, schedule: s }, task = store.create(user, project.id, body, start);
+  assert.equal(task.nextRunAt, previewRecurrence(s, start).occurrences[0]);
+  const at = Date.parse(task.nextRunAt!);
+  const first = store.fire(user, task.id, at)!;
+  assert.ok(first); assert.equal(s2.fire(user, task.id, at), null);
+  assert.deepEqual(s2.get(user, task.id)?.schedule, s);
+  assert.equal(store.fire(user, task.id, at + 6 * 3600000), null);
+  assert.equal(store.runs(user, task.id)[0].status, "skipped");
+  assert.equal(store.get(user, task.id)?.runCount, 1);
+  db.deletePendingPromptsForConversation(first);
+  // Recovery consumes only the persisted due point after several missed days.
+  const recovered = store.fire(user, task.id, at + 3 * 86400000)!;
+  assert.ok(recovered); assert.equal(store.get(user, task.id)?.runCount, 2);
+  assert.equal(store.get(user, task.id)?.nextRunAt, "2026-10-20T08:00:00.000Z");
+  assert.equal(store.runs(user, task.id).length, 3);
+  db.deletePendingPromptsForConversation(recovered);
+  const current = store.get(user, task.id)!;
+  const edited = store.update(user, task.id, current.revision, { ...body, name: "Renamed" }, "active", at + 3 * 86400000 + 1)!;
+  assert.equal(edited.nextRunAt, current.nextRunAt);
+  assert.throws(() => store.update(user, task.id, current.revision, body, "paused"), RecurringConflict);
+  const paused = store.update(user, task.id, edited.revision, body, "paused", at)!;
+  assert.equal(paused.nextRunAt, null); assert.equal(store.fire(user, task.id, at + 10 * 86400000), null);
+  const resumed = store.update(user, task.id, paused.revision, { ...body, maxRuns: 3 }, "active", at + 10 * 86400000)!;
+  assert.equal(resumed.nextRunAt, "2026-10-27T08:00:00.000Z");
+  const original = db.createPendingPrompt.bind(db), count = db.listConversations().length;
+  db.createPendingPrompt = () => { throw new Error("injected crash"); };
+  assert.throws(() => store.fire(user, task.id, Date.parse(resumed.nextRunAt!)), /injected/);
+  assert.equal(db.listConversations().length, count); assert.equal(store.get(user, task.id)?.runCount, 2);
+  db.createPendingPrompt = original;
+  assert.ok(store.fire(user, task.id, Date.parse(resumed.nextRunAt!)));
+  const done = store.get(user, task.id)!;
+  assert.equal(done.state, "completed"); assert.equal(done.nextRunAt, null);
+  store.remove(user, task.id, done.revision); assert.equal(store.get(user, task.id), undefined);
+  store.create(user, project.id, body, start);
+  db.archiveProjectForUser(project.id, user); assert.deepEqual(store.due(at), []);
+});
+test("real routes validate preview and save, persist edits and retain CSRF/owner/revision isolation", async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "intraday-api-"));
+  const app = createApp({ projectRoot: process.cwd(), dataRoot: path.join(root, "data"), tenantRoot: path.join(root, "tenants"), queueAutoStart: false, username: "pp", passwordHash: bcrypt.hashSync("fixture", 4), sessionSecret: "intraday-test-session-secret-long-enough", minimumFreeDiskBytes: 0 });
+  t.after(() => { app.beginShutdown(); app.db.close(); fs.rmSync(root, { recursive: true, force: true }); });
+  const agent = request.agent(app.app), login = await agent.post("/api/auth/login").send({ username: "pp", password: "fixture" }).expect(200), csrf = login.body.csrfToken;
+  const project = app.db.createProject(crypto.randomUUID(), LEGACY_USER_ID, "fixture", root, "tenant-local");
+  const options = await agent.get(`/api/agent-options?projectId=${project.id}`).expect(200), body = { ...input, ...options.body.selection };
+  await request(app.app).post("/api/recurring-tasks/preview").send({ schedule: windows }).expect(401);
+  await agent.post("/api/recurring-tasks/preview").send({ schedule: windows }).expect(403);
+  const preview = await agent.post("/api/recurring-tasks/preview").set("X-CSRF-Token", csrf).send({ schedule: windows }).expect(200);
+  assert.deepEqual(preview.body, previewRecurrence(windows, Date.parse(preview.body.asOf)));
+  const created = await agent.post(`/api/projects/${project.id}/recurring-tasks`).set("X-CSRF-Token", csrf).send(body).expect(201), task = created.body.task;
+  assert.deepEqual(task.schedule, windows);
+  const url = `/api/recurring-tasks/${task.id}`;
+  const duplicate = { ...times, times: ["00:00", "00:00"] };
+  await agent.patch(url).set("X-CSRF-Token", csrf).send({ ...body, schedule: duplicate, state: "active", revision: 1 }).expect(400);
+  await agent.post("/api/recurring-tasks/preview").set("X-CSRF-Token", csrf).send({ schedule: duplicate }).expect(400);
+  const updated = await agent.patch(url).set("X-CSRF-Token", csrf).send({ ...body, schedule: { ...times, times: [...nodes].reverse() }, state: "paused", revision: 1 }).expect(200);
+  assert.deepEqual(updated.body.task.schedule, times); assert.equal(updated.body.task.nextRunAt, null);
+  const read = await agent.get(url).expect(200); assert.deepEqual(read.body.task, updated.body.task);
+  await agent.patch(url).set("X-CSRF-Token", csrf).send({ ...body, state: "active", revision: 1 }).expect(409);
+  const user = crypto.randomUUID(), now = new Date().toISOString(); app.db.createUser({ id: user, username: user, display_name: "fixture", password_hash: "", role: "member", status: "active", created_at: now, updated_at: now });
+  const privateProject = app.db.createProject(crypto.randomUUID(), user, "fixture", path.join(root, "other"), "tenant-local"), other = new RecurringStore(app.db).create(user, privateProject.id, body);
+  await agent.get(`/api/recurring-tasks/${other.id}`).expect(404);
+  await agent.patch(`/api/recurring-tasks/${other.id}`).set("X-CSRF-Token", csrf).send({ ...body, state: "active", revision: 1 }).expect(404);
+  await agent.delete(`/api/recurring-tasks/${other.id}`).set("X-CSRF-Token", csrf).send({ revision: 1 }).expect(404);
+});

@@ -1,3 +1,4 @@
+import { ExtensionGroup } from './extensions-sidebar';
 import { useFeatureSelection } from "./feature-selection-context";
 import {
   useEffect,
@@ -9,7 +10,6 @@ import {
   type PointerEvent as ReactPointerEvent,
 } from "react";
 import { createPortal } from "react-dom";
-import { ParaSidebarProjects } from "./para-sidebar-projects";
 import { ParaVoiceField, paraVoiceBusy, useParaVoiceInput } from "./para-voice-field";
 import { ParaStageMenu, PARA_STAGES as STAGES } from "./para-stage-menu";
 import ReactMarkdown from "react-markdown";
@@ -43,7 +43,6 @@ import { para, newKey, type BoardData, type ParaLink } from "./para-api";
 import { type Project, type Conversation } from "./api";
 import type {
   ParaBoard,
-  ParaSidebarProject,
   ParaProject,
   ParaResource,
   ParaDetail,
@@ -327,31 +326,9 @@ function BoardDeleteForm({ board, onClose, onDeleted }: { board: ParaBoard; onCl
     </form>
   </Dialog>;
 }
-function SidebarProjectForm({ project, mode, onClose, onDeleted }: { project: ParaSidebarProject; mode: "rename" | "archive" | "delete"; onClose: () => void; onDeleted: () => void }) {
-  const [title, setTitle] = useState(project.title);
-  const action = useAction();
-  const label = mode === "rename" ? "改名项目" : mode === "delete" ? "删除项目" : project.archived_at ? "恢复项目" : "归档项目";
-  return <Dialog title={label} onClose={onClose} closeDisabled={action.busy}>
-    <form onSubmit={(event) => {
-      event.preventDefault();
-      void action.run(async () => {
-        if (mode === "delete") { await para.deleteProject(project.id, project.revision); onDeleted(); }
-        else await para.updateProject(project.id, mode === "rename" ? { revision: project.revision, title: title.trim() } : { revision: project.revision, archived: !project.archived_at, confirm_running: true });
-        onClose();
-      });
-    }}>
-      {mode === "rename" ? <label>项目名称<input autoFocus required maxLength={180} value={title} onChange={(event) => setTitle(event.target.value)} disabled={action.busy} /></label>
-        : <><p>确定{label.slice(0, 2)}“{project.title}”？</p><p className="para-hint">{mode === "delete" ? "项目简报和关联会被永久移除，已有会话和资料原件保留。此操作无法恢复。" : project.archived_at ? "恢复后，项目会重新出现在看板和侧栏。" : "归档后可随时恢复。已关联的运行会话和自动续跑会继续执行。"}</p></>}
-      <ErrorBox error={action.error} />
-      <footer><button type="button" onClick={onClose} disabled={action.busy}>取消</button><button className={mode === "delete" ? "para-danger" : "para-primary"} disabled={action.busy || (mode === "rename" && !title.trim())}>{mode === "rename" ? "保存名称" : mode === "delete" ? "确认删除" : label}</button></footer>
-    </form>
-  </Dialog>;
-}
 export function ParaSidebar({
   selected,
-  selectedProject,
   query,
-  accountId,
   onOpen,
   onCreate,
   onDeleted,
@@ -367,37 +344,26 @@ export function ParaSidebar({
   const [boards, setBoards] = useState<ParaBoard[]>([]),
     [error, setError] = useState(""),
     [archives, setArchives] = useState(false),
-    [menu, setMenu] = useState<{ id: string; top: number; left: number; anchorTop: number; project?: ParaSidebarProject } | null>(null),
+    [menu, setMenu] = useState<{ id: string; top: number; left: number; anchorTop: number } | null>(null),
     [renaming, setRenaming] = useState<ParaBoard | null>(null),
     [deleting, setDeleting] = useState<ParaBoard | null>(null),
     [dragging, setDragging] = useState<string | null>(null),
     [drop, setDrop] = useState<{ id: string; placement: "before" | "after" } | null>(null);
   const drag = useRef<{ source: string; target?: string; placement?: "before" | "after" } | null>(null);
-  const [projectForm, setProjectForm] = useState<{ project: ParaSidebarProject; mode: "rename" | "archive" | "delete" } | null>(null);
   const [loadedQuery, setLoadedQuery] = useState<string | null>(null);
   const [retry, setRetry] = useState(0);
-  const storageKey = `para-sidebar-expanded:${accountId}`;
-  const [expanded, setExpanded] = useState<Record<string, boolean>>(() => {
-    try { return JSON.parse(localStorage.getItem(storageKey) || "{}") ?? {}; } catch { return {}; }
-  });
   const search = query.trim().slice(0, 180);
-  const [searchCollapsed, setSearchCollapsed] = useState<Record<string, boolean>>({});
-  useEffect(() => { setSearchCollapsed({}); setMenu(null); }, [search, archives]);
-  useEffect(() => { try { localStorage.setItem(storageKey, JSON.stringify(expanded)); } catch { /* Expansion still works without storage. */ } }, [storageKey, expanded]);
-  function toggle(id: string) {
-    if (search) setSearchCollapsed((value) => ({ ...value, [id]: !value[id] }));
-    else setExpanded((value) => ({ ...value, [id]: !value[id] }));
-  }
+  useEffect(() => { setMenu(null); }, [search, archives]);
   const refreshGeneration = useRef(0);
   const menuRef = useRef<HTMLDivElement>(null);
   const menuTrigger = useRef<HTMLButtonElement | null>(null);
   const action = useAction();
   const menuBoard = boards.find((board) => board.id === menu?.id);
-  function openMenu(id: string, target: HTMLButtonElement, project?: ParaSidebarProject) {
+  function openMenu(id: string, target: HTMLButtonElement) {
     const anchor = target.getBoundingClientRect();
     menuTrigger.current = target;
     action.setError("");
-    setMenu(menu?.id === id ? null : { id, top: Math.max(8, Math.min(anchor.bottom + 5, window.innerHeight - (project ? 194 : 156))), left: Math.max(8, Math.min(anchor.right - 176, window.innerWidth - 184)), anchorTop: anchor.top, project });
+    setMenu(menu?.id === id ? null : { id, top: Math.max(8, Math.min(anchor.bottom + 5, window.innerHeight - 156)), left: Math.max(8, Math.min(anchor.right - 176, window.innerWidth - 184)), anchorTop: anchor.top });
   }
   function moveBoard(source: string, target: string, placement: "before" | "after") {
     if (source === target) return;
@@ -461,8 +427,6 @@ export function ParaSidebar({
   useEffect(() => {
     let live = true;
     const refresh = (event?: Event) => {
-      const project = (event as CustomEvent<{ project?: ParaSidebarProject }> | undefined)?.detail?.project;
-      if (project) setMenu((current) => current?.project?.id === project.id ? { ...current, project } : current);
       const generation = ++refreshGeneration.current;
       void para
         .sidebar(search, archives)
@@ -489,22 +453,15 @@ export function ParaSidebar({
     };
   }, [search, archives, retry]);
   return (
-    <section className="para-sidebar">
-      <div className="section-label project-label">
-        <span>项目看板</span>
-        <button type="button" aria-label="看板操作" title="看板操作" aria-haspopup="menu" aria-expanded={menu?.id === "section"} onClick={(event) => openMenu("section", event.currentTarget)}>
-          <MoreHorizontal size={15} />
-        </button>
-      </div>
+    <ExtensionGroup id="boards" label="项目看板" icon={<LayoutDashboard size={17}/>} onMenu={button => openMenu("section", button)} menuOpen={menu?.id === "section"}>
       {loadedQuery !== search && !error && <div className="list-loading" role="status"><LoaderCircle className="spin" size={14} /><span>正在搜索…</span></div>}
       {loadedQuery === search && boards
         .map((b) => {
-          const isExpanded = search ? !searchCollapsed[b.id] : Boolean(expanded[b.id]);
           return <div className="para-sidebar-board" key={b.id}>
           <div
             key={b.id}
             data-board-id={b.id}
-            className={`para-sidebar-row ${selected === b.id && !selectedProject ? "selected" : ""} ${dragging === b.id ? "dragging" : ""} ${drop?.id === b.id ? `drop-${drop.placement}` : ""}`}
+            className={`para-sidebar-row ${selected === b.id ? "selected" : ""} ${dragging === b.id ? "dragging" : ""} ${drop?.id === b.id ? `drop-${drop.placement}` : ""}`}
             draggable={!action.busy && !search}
             onDragStart={(event) => { drag.current = { source: b.id }; setDragging(b.id); setMenu(null); event.dataTransfer.setData("application/x-para-board", b.id); event.dataTransfer.effectAllowed = "move"; }}
             onDragOver={(event) => {
@@ -534,16 +491,15 @@ export function ParaSidebar({
                 const target = visible[index + (event.key === "ArrowUp" ? -1 : 1)];
                 if (target) moveBoard(b.id, target.id, event.key === "ArrowUp" ? "before" : "after");
               }}><GripVertical size={12} /></button>
-            <button type="button" className="para-sidebar-item" aria-expanded={isExpanded} onClick={() => { setMenu(null); toggle(b.id); onOpen(b.id); }}>
-              <LayoutDashboard size={17} /><span>{b.name}</span>{b.archived_at && <Archive size={13} aria-label="已归档" />}
+            <button type="button" className="para-sidebar-item" onClick={() => { setMenu(null); onOpen(b.id); }}>
+              <span>{b.name}</span>{b.archived_at && <Archive size={13} aria-label="已归档" />}
             </button>
-            <button type="button" className="para-sidebar-toggle" aria-label={`${isExpanded ? "收起" : "展开"}看板 ${b.name}`} aria-expanded={isExpanded} onClick={() => toggle(b.id)}><ChevronDown size={14} /></button>
+
             <button type="button" className="para-sidebar-more" aria-label={`看板 ${b.name} 操作`} title="看板操作"
               aria-haspopup="menu" aria-expanded={menu?.id === b.id} disabled={action.busy}
               onClick={(event) => openMenu(b.id, event.currentTarget)}><MoreHorizontal size={16} /></button>
           </div>
-          {isExpanded && <ParaSidebarProjects boardId={b.id} query={search} archives={archives} selected={selected === b.id ? selectedProject : null} disabled={Boolean(b.archived_at)} menuProjectId={menu?.project?.id ?? null}
-            onOpen={(id) => onOpen(b.id, id)} onMenu={(p, target) => openMenu(`project:${p.id}`, target, p)} />}
+
           </div>;
         })}
       {loadedQuery === search && !boards.length && search && !error && <div className="project-empty">没有匹配看板或项目</div>}
@@ -557,13 +513,13 @@ export function ParaSidebar({
           className="para-sidebar-empty"
           onClick={() => setArchives(!archives)}
         >
-          {archives ? "隐藏归档看板与项目" : "查看归档看板与项目"}
+          {archives ? "隐藏归档看板" : "查看归档看板"}
         </button>
       )}
       {error && <div className="para-sidebar-load-error" role="alert">{error}<button onClick={() => setRetry((n) => n + 1)}>重试</button></div>}
       {action.error && <small role="alert">{action.error}</small>}
-      {menu && (menuBoard || menu.project || menu.id === "section") && createPortal(<div ref={menuRef} className="project-menu-panel para-board-menu" role="menu"
-        aria-label={menu.project ? `看板内项目 ${menu.project.title} 操作` : menuBoard ? `看板 ${menuBoard.name} 操作` : "看板操作"} style={{ top: menu.top, left: menu.left }}
+      {menu && (menuBoard || menu.id === "section") && createPortal(<div ref={menuRef} className="project-menu-panel para-board-menu" role="menu"
+        aria-label={menuBoard ? `看板 ${menuBoard.name} 操作` : "看板操作"} style={{ top: menu.top, left: menu.left }}
         onKeyDown={(event) => {
           if (event.key === "Tab") setMenu(null);
           if (event.key === "ArrowDown" || event.key === "ArrowUp") {
@@ -573,12 +529,7 @@ export function ParaSidebar({
             items[(index + (event.key === "ArrowDown" ? 1 : -1) + items.length) % items.length]?.focus();
           }
         }}>
-        {menu.project ? <>
-          <button type="button" role="menuitem" onClick={() => { onOpen(menu.project!.board_id, menu.project!.id); setMenu(null); }}><ArrowRight size={16} /><span>打开项目</span></button>
-          <button type="button" role="menuitem" onClick={() => { setProjectForm({ project: menu.project!, mode: "rename" }); setMenu(null); }}><Pencil size={16} /><span>改名</span></button>
-          <button type="button" role="menuitem" onClick={() => { setProjectForm({ project: menu.project!, mode: "archive" }); setMenu(null); }}>{menu.project.archived_at ? <RotateCcw size={16} /> : <Archive size={16} />}<span>{menu.project.archived_at ? "恢复项目" : "归档项目"}</span></button>
-          {menu.project.archived_at && <button type="button" role="menuitem" className="danger" onClick={() => { setProjectForm({ project: menu.project!, mode: "delete" }); setMenu(null); }}><Trash2 size={16} /><span>删除项目</span></button>}
-        </> : menuBoard ? <>
+        {menuBoard ? <>
         <button type="button" role="menuitem" disabled={action.busy} onClick={() => { setRenaming(menuBoard); setMenu(null); }}><Pencil size={16} /><span>改名</span></button>
         <button type="button" role="menuitem" className={menuBoard.archived_at ? undefined : "danger"} disabled={action.busy}
           onClick={() => void action.run(async () => {
@@ -588,10 +539,9 @@ export function ParaSidebar({
         {menuBoard.archived_at && <button type="button" role="menuitem" className="danger" onClick={() => { setDeleting(menuBoard); setMenu(null); }}><Trash2 size={16} /><span>删除看板</span></button>}
         </> : <button type="button" role="menuitem" onClick={() => { setMenu(null); onCreate(); }}><Plus size={16} /><span>新建看板</span></button>}
       </div>, document.body)}
-      {projectForm && <SidebarProjectForm {...projectForm} onClose={() => setProjectForm(null)} onDeleted={() => { if (selectedProject === projectForm.project.id) onOpen(projectForm.project.board_id); }} />}
       {renaming && <BoardRenameForm board={renaming} onClose={() => setRenaming(null)} />}
       {deleting && <BoardDeleteForm board={deleting} onClose={() => setDeleting(null)} onDeleted={() => { onDeleted(deleting.id); setDeleting(null); }} />}
-    </section>
+    </ExtensionGroup>
   );
 }
 export function ParaWorkspace({

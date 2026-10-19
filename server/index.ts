@@ -49,11 +49,21 @@ runtimeCleanupTimer.unref();
 
 const SHUTDOWN_DRAIN_TIMEOUT_MS = 29 * 60_000;
 let stopping = false;
+let publicationRecovery: Promise<void> | undefined;
+const publicationRecoveryTimer = setInterval(() => {
+  if (stopping || publicationRecovery) return;
+  publicationRecovery = runner.recoverJobFinalizations({ committedOnly: true }).then(report => {
+    if (report.published || report.errors.length) logger[report.errors.length ? "warn" : "info"](report, "Committed Job publication recovery");
+  }).catch(error => logger.error({ error }, "Committed Job publication recovery failed"))
+    .finally(() => { publicationRecovery = undefined; });
+}, 30_000);
+publicationRecoveryTimer.unref();
 
 async function shutdown(signal: string): Promise<void> {
   if (stopping) return;
   stopping = true;
   clearInterval(runtimeCleanupTimer);
+  clearInterval(publicationRecoveryTimer);
   beginShutdown();
   logger.info({ signal }, "Codex Web stopping");
   const deadline = Date.now() + SHUTDOWN_DRAIN_TIMEOUT_MS;
@@ -66,6 +76,7 @@ async function shutdown(signal: string): Promise<void> {
     process.exit(1);
   }
   await waitForBackgroundTasks();
+  await publicationRecovery;
   logger.info("Running jobs drained; closing network services");
   remoteWorkers.close();
   server.close(() => {

@@ -1,11 +1,12 @@
+import { OpportunityImages } from './opportunity-images.js';
 import type { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import type { AppDatabase, SessionRow, JobRow, StoredAgentSelection } from './db.js';
 import { OpportunityStore, OpportunityError } from './opportunity-store.js';
 const err=(res:Response,e:unknown)=>res.status(e instanceof OpportunityError?e.status:400).json({error:e instanceof z.ZodError?e.issues.map(i=>i.path.join('.')+'：'+i.message).join('；'):e instanceof Error?e.message:'机会操作失败'});
-export function mountOpportunityAutomation(api:Router,db:AppDatabase,authenticate:(req:Request)=>JobRow|null) {
-  const store=new OpportunityStore(db);
-  api.post('/automation/jobs/:jobId/opportunities',(req,res)=>{
+export function mountOpportunityAutomation(api:Router,db:AppDatabase,authenticate:(req:Request)=>JobRow|null,tenantRoot:string) {
+  const store=new OpportunityStore(db),images=new OpportunityImages(db,tenantRoot);
+  api.post('/automation/jobs/:jobId/opportunities',async(req,res)=>{
     const job=authenticate(req);if(!job)return res.status(401).json({error:'任务凭据无效或任务已结束。'});
     const c=db.getConversation(job.conversation_id);if(!c?.project_id||c.deleted_at)return res.status(403).json({error:'当前会话不可用。'});
     try {
@@ -25,6 +26,7 @@ export function mountOpportunityAutomation(api:Router,db:AppDatabase,authenticat
         case 'inventory': {const c=store.context(user,topicId),offset=z.number().int().nonnegative().parse(data.offset??0),limit=z.number().int().min(1).max(25).parse(data.limit??10);return res.json({items:c.inventory.slice(offset,offset+limit),total:c.inventory.length,nextOffset:offset+limit<c.inventory.length?offset+limit:null});}
         case 'history':return res.json(store.history(user,Number(data.offset)||0,Number(data.limit)||100));
         case 'detail':return res.json(store.detail(user,String(data.ideaId)));
+        case 'images':return res.json(await images.attach(user,c.id,job.id,data));
         case 'evidence':return res.json(store.correctEvidence(user,String(data.ideaId),c.id,job.id,data));
         case 'begin':return res.json(store.begin(user,topicId,c.id,job.id));
         case 'ingest':return res.json({candidates:store.ingest(user,batchId,c.id,data.candidates).map(r=>({idea:{id:r.idea.id,state:r.idea.state,title:r.idea.content.title},outcome:r.outcome,neighbors:r.neighbors}))});
@@ -42,9 +44,9 @@ export function mountOpportunityAutomation(api:Router,db:AppDatabase,authenticat
     }catch(e){return err(res,e);}
   });
 }
-export function mountOpportunityRoutes(api:Router,db:AppDatabase,options:{selection:(u:string,e:string)=>StoredAgentSelection;changed:(cid:string)=>void}) {
-  const store=new OpportunityStore(db),owner=(res:Response)=>(res.locals.session as SessionRow).user_id;
-  const handle=(fn:(req:Request,res:Response)=>unknown)=>(req:Request,res:Response)=>{try{res.setHeader('Cache-Control','private, no-store');return fn(req,res);}catch(e){return err(res,e);}};
+export function mountOpportunityRoutes(api:Router,db:AppDatabase,options:{selection:(u:string,e:string)=>StoredAgentSelection;changed:(cid:string)=>void;tenantRoot:string;activate:(cid:string)=>string}) {
+  const store=new OpportunityStore(db),images=new OpportunityImages(db,options.tenantRoot),owner=(res:Response)=>(res.locals.session as SessionRow).user_id;
+  const handle=(fn:(req:Request,res:Response)=>unknown)=>(async(req:Request,res:Response)=>{try{res.setHeader('Cache-Control','private, no-store');return await fn(req,res);}catch(e){return err(res,e);}});
   api.get('/opportunities/topics',handle((_req,res)=>res.json({topics:store.topics(owner(res))})));
   api.get('/opportunities',handle((req,res)=>res.json(store.view(owner(res),typeof req.query.topicId==='string'?req.query.topicId:undefined,String(req.query.tab??'screen'),Number(req.query.offset)||0))));
   api.post('/opportunities/topics',handle((req,res)=>res.status(201).json({topic:store.createTopic(owner(res),req.body,String(req.body?.requestKey))})));
@@ -56,8 +58,11 @@ export function mountOpportunityRoutes(api:Router,db:AppDatabase,options:{select
   api.post('/opportunities/topics/:id/task',handle((req,res)=>{const user=owner(res),t=store.topic(user,String(req.params.id)),p=store.serverProject(user,t.project_id);return res.json({task:store.configureTask(user,t.id,options.selection(user,p.executor_id),req.body?.taskId)});}));
   api.post('/opportunities/topics/:id/discover',handle((req,res)=>{const user=owner(res),t=store.topic(user,String(req.params.id)),p=store.serverProject(user,t.project_id);store.reconcile(user,t.id);const result=store.start(user,t.id,options.selection(user,p.executor_id),String(req.body?.requestKey));options.changed(result.conversationId);return res.status(201).json(result);}));
   api.post('/opportunities/topics/:id/preferences',handle((req,res)=>res.json({preferences:store.setPreference(owner(res),String(req.params.id),req.body)})));
+  api.get('/opportunities/ideas/:id/images/:image/status',handle((req,res)=>{images.row(owner(res),String(req.params.id),String(req.params.image));return res.json(store.images(owner(res),String(req.params.id)).find(i=>i.id===req.params.image));}));
+  api.get('/opportunities/ideas/:id/images/:image',handle(async(req,res)=>{const result=await images.bytes(owner(res),String(req.params.id),String(req.params.image));res.setHeader('Content-Type',result.row.mime_type);res.setHeader('X-Content-Type-Options','nosniff');return res.send(result.bytes);}));
+  api.post('/opportunities/ideas/:id/images/:image/activate',handle((req,res)=>{const row=images.row(owner(res),String(req.params.id),String(req.params.image));return res.json({state:options.activate(row.conversation_id)});}));
   api.get('/opportunities/ideas/:id',handle((req,res)=>res.json(store.detail(owner(res),String(req.params.id)))));
   api.post('/opportunities/ideas/:id/feedback',handle((req,res)=>res.json({idea:store.feedback(owner(res),String(req.params.id),req.body)})));
-  api.post('/opportunities/ideas/:id/research',handle((req,res)=>{const user=owner(res),idea=store.idea(user,String(req.params.id)),p=store.serverProject(user,idea.project_id),result=store.start(user,idea.topic_id,options.selection(user,p.executor_id),String(req.body?.requestKey),idea.id);options.changed(result.conversationId);return res.status(201).json(result);}));
+  api.post('/opportunities/ideas/:id/research',handle((req,res)=>{const user=owner(res),idea=store.idea(user,String(req.params.id)),p=store.serverProject(user,idea.project_id),result=store.start(user,idea.topic_id,options.selection(user,p.executor_id),String(req.body?.requestKey),idea.id,req.body?.draftFeedback);options.changed(result.conversationId);return res.status(201).json(result);}));
   api.post('/opportunities/ideas/:id/project',handle((req,res)=>res.json({project:store.toProject(owner(res),String(req.params.id),String(req.body?.boardId),String(req.body?.requestKey))})));
 }

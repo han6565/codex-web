@@ -1,3 +1,4 @@
+import { migrateJudgments } from "./judgment-schema.js";
 import { migrateOpportunities } from "./opportunity-schema.js";
 import { migrateRecurring } from "./recurring-store.js";
 import { DEFAULT_FEATURE_SELECTION, isFeatureSelection, type FeatureSelection } from "../src/feature-selection.js";
@@ -34,6 +35,7 @@ export class PublicShareStorageBusyError extends Error {
 }
 
 export type JobAttemptState = {
+  retryKind?: "capacity" | "routing";
   retries: number;
   capacityStartedAt: number | null;
   nextAttemptAt: string | null;
@@ -468,6 +470,9 @@ export type FileRow = {
   mime_type: string;
   size: number;
   sha256?: string | null;
+  presentation_mode?: "reader" | "web";
+  presentation_manifest?: string | null;
+  previous_file_id?: string | null;
   kind: "upload" | "output";
   created_at: string;
 };
@@ -482,6 +487,7 @@ export type PublicFileShareRow = {
   enabled_at: string | null;
   disabled_at: string | null;
   expires_at: string | null;
+  revision: number;
 };
 
 export type PublicFileShareAssetRow = {
@@ -492,6 +498,8 @@ export type PublicFileShareAssetRow = {
 };
 
 export type ManagedPublicFileShareRow = PublicFileShareRow & {
+  presentation_mode: "reader" | "web";
+  storage_state: string;
   current_file_name: string;
   mime_type: string;
   size: number;
@@ -607,6 +615,7 @@ export type FinalizationState = "staging" | "files_ready" | "db_committed" | "pu
 export type JobFinalizationPayload = {
   message: MessageRow;
   files: FileRow[];
+  personalContextRevision?: number;
 };
 
 export type JobRow = {
@@ -788,6 +797,14 @@ export class AppDatabase {
       this.sqlite.prepare("UPDATE public_file_shares SET expires_at=? WHERE enabled=1").run(expiresAt);
       this.sqlite.exec("CREATE INDEX public_file_shares_expiry_idx ON public_file_shares(enabled,expires_at)");
     });
+    this.applyMigration(2026101702, "file-presentation-versions", () => {
+      this.sqlite.exec(`ALTER TABLE files ADD COLUMN presentation_mode TEXT NOT NULL DEFAULT 'reader' CHECK(presentation_mode IN ('reader','web'));
+        ALTER TABLE files ADD COLUMN presentation_manifest TEXT;
+        ALTER TABLE files ADD COLUMN previous_file_id TEXT;
+        ALTER TABLE public_file_shares ADD COLUMN revision INTEGER NOT NULL DEFAULT 0;
+        CREATE TRIGGER file_presentation_immutable BEFORE UPDATE OF presentation_mode,presentation_manifest,previous_file_id ON files
+        BEGIN SELECT RAISE(ABORT,'Presentation versions are immutable; redeliver a private version'); END;`);
+    });
     this.applyMigration(2026101001, "project-recurring-tasks", () => migrateRecurring(this.sqlite));
     this.applyMigration(2026101402, "opportunity-cards", () => migrateOpportunities(this.sqlite));
     this.applyMigration(2026101403, "opportunity-topic-order", () => {
@@ -809,6 +826,25 @@ export class AppDatabase {
     this.applyMigration(2026101405, "opportunity-project-knowledge", () => {
       this.sqlite.exec(`ALTER TABLE opportunity_topics ADD COLUMN knowledge_path TEXT NOT NULL DEFAULT '';
         ALTER TABLE opportunity_feedback_learning ADD COLUMN knowledge_files_json TEXT NOT NULL DEFAULT '[]';`);
+    });
+    this.applyMigration(2026101701, "opportunity-images", () => {
+      this.sqlite.exec(`CREATE TABLE opportunity_images (
+        id TEXT PRIMARY KEY, idea_id TEXT NOT NULL REFERENCES opportunity_ideas(id) ON DELETE CASCADE,
+        user_id TEXT NOT NULL REFERENCES users(id), conversation_id TEXT NOT NULL, relative_path TEXT NOT NULL,
+        mime_type TEXT NOT NULL, size INTEGER NOT NULL, sha256 TEXT NOT NULL, width INTEGER NOT NULL, height INTEGER NOT NULL,
+        alt TEXT NOT NULL, caption TEXT NOT NULL DEFAULT '', position INTEGER NOT NULL, created_at TEXT NOT NULL,
+        UNIQUE(idea_id,position)); CREATE INDEX opportunity_images_conversation ON opportunity_images(conversation_id);`);
+    });
+    this.applyMigration(2026101801, "judgment-book-v1", () => migrateJudgments(this.sqlite));
+    this.applyMigration(2026101901, "opportunity-background-voice-feedback", () => {
+      this.sqlite.exec(`CREATE TABLE opportunity_voice_feedback (
+        id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), idea_id TEXT NOT NULL REFERENCES opportunity_ideas(id) ON DELETE CASCADE,
+        client_recording_id TEXT NOT NULL, payload_hash TEXT NOT NULL, audio_json TEXT NOT NULL,
+        draft_text TEXT NOT NULL, base_note TEXT NOT NULL, transcript TEXT NOT NULL DEFAULT '', applied_revision INTEGER,
+        state TEXT NOT NULL CHECK(state IN ('queued','processing','failed','completed')), error TEXT,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(user_id,client_recording_id));
+        CREATE INDEX opportunity_voice_queue ON opportunity_voice_feedback(state,created_at);
+        CREATE INDEX opportunity_voice_idea ON opportunity_voice_feedback(user_id,idea_id,applied_revision);`);
     });
     if (recoverJobs) {
       // Local running child processes cannot survive an application restart. Remote
@@ -2811,7 +2847,12 @@ export class AppDatabase {
     return this.sqlite.prepare(`SELECT ${conversationSelect} FROM conversations WHERE deletion_state IN ('deleting','cleanup_failed') ORDER BY updated_at,id`).all() as ConversationRow[];
   }
 
+  judgmentAttachmentProtectsConversation(id: string): boolean {
+    return !!this.sqlite.prepare('SELECT 1 FROM judgment_attachments a JOIN files f ON f.id=a.file_id WHERE f.conversation_id=? LIMIT 1').get(id);
+  }
+
   beginConversationDeletion(id: string, userId: string): ConversationRow | undefined {
+    if(this.judgmentAttachmentProtectsConversation(id)) return undefined;
     const now = new Date().toISOString();
     this.sqlite.exec("BEGIN IMMEDIATE");
     try {
@@ -2850,11 +2891,12 @@ export class AppDatabase {
     return this.getConversation(id)!;
   }
 
-  findReusableEmptyConversation(userId: string, projectId: string): ConversationRow | undefined {
+  findReusableEmptyConversation(userId: string, projectId: string, selection?: StoredAgentSelection): ConversationRow | undefined {
     return this.sqlite.prepare(`
       SELECT ${conversationSelect}
       FROM conversations
       WHERE user_id=? AND project_id=?
+        AND (? IS NULL OR (agent_model=? AND reasoning_effort=?))
         AND title='新任务' AND title_source='default'
         AND status='idle' AND external_status='idle'
         AND sync_origin='codex_web' AND codex_thread_id IS NULL AND remote_updated_at=0
@@ -2883,13 +2925,13 @@ export class AppDatabase {
         )
       ORDER BY sidebar_order DESC,created_at DESC,id DESC
       LIMIT 1
-    `).get(userId, projectId) as ConversationRow | undefined;
+    `).get(userId, projectId, selection?.model ?? null, selection?.model ?? null, selection?.reasoningEffort ?? null) as ConversationRow | undefined;
   }
 
-  reuseEmptyConversationForNewTask(userId: string, projectId: string): ConversationRow | undefined {
+  reuseEmptyConversationForNewTask(userId: string, projectId: string, selection?: StoredAgentSelection): ConversationRow | undefined {
     this.sqlite.exec("BEGIN IMMEDIATE");
     try {
-      const reusable = this.findReusableEmptyConversation(userId, projectId);
+      const reusable = this.findReusableEmptyConversation(userId, projectId, selection);
       if (!reusable) {
         this.sqlite.exec("COMMIT");
         return undefined;
@@ -2905,10 +2947,10 @@ export class AppDatabase {
     }
   }
 
-  createOrReuseEmptyConversation(id: string, selection: StoredAgentSelection, userId: string, projectId: string): { conversation: ConversationRow; reused: boolean } {
+  createOrReuseEmptyConversation(id: string, selection: StoredAgentSelection, userId: string, projectId: string, reuseSelection?: StoredAgentSelection): { conversation: ConversationRow; reused: boolean } {
     this.sqlite.exec("BEGIN IMMEDIATE");
     try {
-      const reusable = this.findReusableEmptyConversation(userId, projectId);
+      const reusable = this.findReusableEmptyConversation(userId, projectId, reuseSelection);
       if (reusable) {
         this.bumpConversationSidebarOrder(reusable.id);
         const promoted = this.getConversationForUser(reusable.id, userId);
@@ -3563,6 +3605,18 @@ export class AppDatabase {
     if (!conversation) return undefined;
     this.sqlite.prepare("UPDATE conversations SET has_unread_result=0,unread_anchor_message_id=NULL WHERE id=? AND user_id=? AND deleted_at IS NULL").run(id, userId);
     return this.getConversationForUser(id, userId);
+  }
+
+  markProjectResultsSeenForUser(projectId: string, userId: string): number | undefined {
+    if (!this.getActiveProjectForUser(projectId, userId)) return undefined;
+    // One statement acknowledges the current results, including unloaded tasks.
+    // Later finalizations can set their unread marker and first-result anchor again.
+    const result = this.sqlite.prepare(`
+      UPDATE conversations SET has_unread_result=0,unread_anchor_message_id=NULL
+      WHERE project_id=? AND user_id=? AND deleted_at IS NULL
+        AND (has_unread_result<>0 OR unread_anchor_message_id IS NOT NULL)
+    `).run(projectId, userId);
+    return Number(result.changes);
   }
 
   archiveConversationForUser(id: string, userId: string): ConversationRow | undefined {
@@ -4488,8 +4542,10 @@ export class AppDatabase {
   }
 
   addFile(file: FileRow): void {
-    this.sqlite.prepare("INSERT INTO files(id,conversation_id,message_id,pending_prompt_id,composer_draft_id,original_name,relative_path,source_path,mime_type,size,sha256,kind,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)").run(
-      file.id, file.conversation_id, file.message_id, file.pending_prompt_id ?? null, file.composer_draft_id ?? null, file.original_name, normalizeStoredRelativePath(file.relative_path), file.source_path ?? null, file.mime_type, file.size, file.sha256 ?? null, file.kind, file.created_at,
+    if (file.presentation_mode === "web" && (file.kind !== "output" || file.mime_type.split(";", 1)[0] !== "text/html"
+      || !file.presentation_manifest || !file.sha256 || file.size > 5 * 1024 * 1024)) throw new Error("Web delivery requires verified output metadata");
+    this.sqlite.prepare("INSERT INTO files(id,conversation_id,message_id,pending_prompt_id,composer_draft_id,original_name,relative_path,source_path,mime_type,size,sha256,kind,created_at,presentation_mode,presentation_manifest,previous_file_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(
+      file.id, file.conversation_id, file.message_id, file.pending_prompt_id ?? null, file.composer_draft_id ?? null, file.original_name, normalizeStoredRelativePath(file.relative_path), file.source_path ?? null, file.mime_type, file.size, file.sha256 ?? null, file.kind, file.created_at, file.presentation_mode ?? "reader", file.presentation_manifest ?? null, file.previous_file_id ?? null,
     );
   }
 
@@ -4840,18 +4896,19 @@ export class AppDatabase {
     return this.sqlite.prepare("SELECT * FROM public_file_shares WHERE file_id=?").get(fileId) as PublicFileShareRow | undefined;
   }
 
-  listActivePublicFileShares(userId: string): ManagedPublicFileShareRow[] {
+  listPublicFileShares(userId: string): ManagedPublicFileShareRow[] {
     return this.sqlite.prepare(`
-      SELECT share.*,file.original_name AS current_file_name,file.mime_type,file.size,
+      SELECT share.*,file.original_name AS current_file_name,file.mime_type,file.size,file.presentation_mode,
+        COALESCE(storage.state,'local') AS storage_state,
         file.conversation_id,conversation.title AS conversation_title
       FROM public_file_shares share
       JOIN files file ON file.id=share.file_id
       JOIN conversations conversation ON conversation.id=file.conversation_id
-      WHERE share.user_id=? AND share.enabled=1 AND file.kind='output'
-        AND share.expires_at>?
+      LEFT JOIN conversation_storage storage ON storage.conversation_id=conversation.id
+      WHERE share.user_id=? AND file.kind='output'
         AND conversation.user_id=? AND conversation.deleted_at IS NULL AND conversation.deletion_state='active'
       ORDER BY share.enabled_at DESC,share.id DESC
-    `).all(userId, new Date().toISOString(), userId) as ManagedPublicFileShareRow[];
+    `).all(userId, userId) as ManagedPublicFileShareRow[];
   }
 
   getActivePublicFile(fileId: string): { share: PublicFileShareRow; file: FileRow } | undefined {
@@ -4891,7 +4948,7 @@ export class AppDatabase {
         VALUES(?,?,?,?,1,?,?,NULL,?)
         ON CONFLICT(file_id) DO UPDATE SET
           user_id=excluded.user_id,file_name_snapshot=excluded.file_name_snapshot,
-          enabled=1,enabled_at=excluded.enabled_at,disabled_at=NULL,expires_at=excluded.expires_at
+          enabled=1,enabled_at=excluded.enabled_at,disabled_at=NULL,expires_at=excluded.expires_at,revision=CASE WHEN public_file_shares.enabled=1 AND public_file_shares.expires_at>excluded.enabled_at THEN public_file_shares.revision ELSE public_file_shares.revision+1 END
       `).run(shareId, input.file.id, input.userId, input.file.original_name, existing?.created_at ?? now, now, expiresAt);
       this.sqlite.prepare("DELETE FROM public_file_share_assets WHERE share_id=?").run(shareId);
       const insertAsset = this.sqlite.prepare(`
@@ -4912,7 +4969,7 @@ export class AppDatabase {
     const now = new Date().toISOString();
     this.sqlite.exec("BEGIN IMMEDIATE");
     try {
-      this.sqlite.prepare("UPDATE public_file_shares SET enabled=0,disabled_at=? WHERE file_id=? AND user_id=?")
+      this.sqlite.prepare("UPDATE public_file_shares SET enabled=0,disabled_at=?,revision=revision+1 WHERE file_id=? AND user_id=?")
         .run(now, fileId, userId);
       this.sqlite.prepare("DELETE FROM public_file_share_assets WHERE share_id=?").run(share.id);
       this.sqlite.exec("COMMIT");
@@ -5596,7 +5653,15 @@ export class AppDatabase {
   }
 
   getAgentSelectionPreference(userId = LEGACY_USER_ID): StoredAgentSelection | undefined {
-    const row = this.sqlite.prepare("SELECT value FROM user_settings WHERE user_id=? AND key='agent_selection'").get(userId) as { value: string } | undefined;
+    return this.readAgentSelectionSetting(userId, "agent_selection");
+  }
+
+  getNewConversationAgentSelection(userId: string): StoredAgentSelection | undefined {
+    return this.readAgentSelectionSetting(userId, "new_conversation_agent_selection");
+  }
+
+  private readAgentSelectionSetting(userId: string, key: string): StoredAgentSelection | undefined {
+    const row = this.sqlite.prepare("SELECT value FROM user_settings WHERE user_id=? AND key=?").get(userId, key) as { value: string } | undefined;
     if (!row) return undefined;
     try {
       const value = JSON.parse(row.value) as Partial<StoredAgentSelection>;
@@ -5610,6 +5675,17 @@ export class AppDatabase {
   setAgentSelectionPreference(selection: StoredAgentSelection, userId = LEGACY_USER_ID): void {
     this.sqlite.prepare(`
       INSERT INTO user_settings(user_id,key,value,updated_at) VALUES(?,'agent_selection',?,?)
+      ON CONFLICT(user_id,key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
+    `).run(userId, JSON.stringify(selection), new Date().toISOString());
+  }
+
+  setNewConversationAgentSelection(userId: string, selection: StoredAgentSelection | null): void {
+    if (!selection) {
+      this.sqlite.prepare("DELETE FROM user_settings WHERE user_id=? AND key='new_conversation_agent_selection'").run(userId);
+      return;
+    }
+    this.sqlite.prepare(`
+      INSERT INTO user_settings(user_id,key,value,updated_at) VALUES(?,'new_conversation_agent_selection',?,?)
       ON CONFLICT(user_id,key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
     `).run(userId, JSON.stringify(selection), new Date().toISOString());
   }
@@ -5633,7 +5709,7 @@ export class AppDatabase {
         this.sqlite.exec("ROLLBACK");
         return null;
       }
-      const next = { paraBoard: value.paraBoard, opportunityCards: value.opportunityCards ?? current.opportunityCards ?? false, revision: current.revision + 1 };
+      const next = { paraBoard: value.paraBoard, opportunityCards: value.opportunityCards ?? current.opportunityCards ?? false, ...(value.judgmentBook !== undefined || current.judgmentBook !== undefined ? {judgmentBook:value.judgmentBook ?? current.judgmentBook ?? false} : {}), revision: current.revision + 1 };
       this.sqlite.prepare(`
         INSERT INTO user_settings(user_id,key,value,updated_at) VALUES(?,'feature_selection',?,?)
         ON CONFLICT(user_id,key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
@@ -5809,9 +5885,11 @@ export class AppDatabase {
     const job = this.getJob(jobId);
     const conversation = this.getConversation(conversationId);
     if (!job || job.conversation_id !== conversationId || !conversation) return undefined;
+    const attempt = this.getJobAttemptState(jobId);
     const own = this.getJobRecoveryCheckpoint(jobId)
-      ?? (this.getJobAttemptState(jobId)?.retries
-        ? this.captureJobRecovery(jobId, "capacity", "模型容量等待后恢复") : undefined);
+      ?? (attempt?.retries
+        ? this.captureJobRecovery(jobId, attempt.retryKind === "routing" ? "upstream" : "capacity",
+          attempt.retryKind === "routing" ? "上游路由连接等待后恢复" : "模型容量等待后恢复") : undefined);
     if (own?.threadId === conversation.codex_thread_id) return own;
     // A completed later task closes the recovery context. Commentary, imports,
     // failed continuations and cancellation of unstarted queue items do not.
@@ -5836,12 +5914,17 @@ export class AppDatabase {
   }
 
   deferJobForCapacity(jobId: string, state: JobAttemptState): boolean {
+    return this.deferJobForRetry(jobId, state);
+  }
+
+  deferJobForRetry(jobId: string, state: JobAttemptState): boolean {
     this.sqlite.exec("BEGIN IMMEDIATE");
     try {
       const job = this.getJob(jobId);
       if (!job || job.status !== "running") { this.sqlite.exec("ROLLBACK"); return false; }
       this.saveJobAttemptState(jobId, state);
-      this.captureJobRecovery(jobId, "capacity", "模型容量不足，等待续接");
+      this.captureJobRecovery(jobId, state.retryKind === "routing" ? "upstream" : "capacity",
+        state.retryKind === "routing" ? "上游路由连接暂时不可用，等待续接" : "模型容量不足，等待续接");
       this.updateJob(jobId, "queued");
       this.updateConversation(job.conversation_id, { status: "idle" });
       this.sqlite.exec("COMMIT");
@@ -6037,8 +6120,8 @@ export class AppDatabase {
             ELSE finalization_error
           END,
           updated_at=?
-        WHERE id=?
-      `).run(status, error, new Date().toISOString(), id);
+        WHERE id=? AND NOT (status='completed' AND finalization_state IN ('db_committed','published') AND ?<>'completed')
+      `).run(status, error, new Date().toISOString(), id, status);
       return;
     }
     this.sqlite.prepare("UPDATE jobs SET status=?,error=?,updated_at=? WHERE id=?").run(status, error, new Date().toISOString(), id);
@@ -6087,14 +6170,19 @@ export class AppDatabase {
       const insertFile = this.sqlite.prepare(`
         INSERT OR IGNORE INTO files(
           id,conversation_id,message_id,pending_prompt_id,composer_draft_id,original_name,
-          relative_path,source_path,mime_type,size,sha256,kind,created_at
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+          relative_path,source_path,mime_type,size,sha256,kind,created_at,
+          presentation_mode,presentation_manifest,previous_file_id
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
       `);
       for (const file of payload.files) insertFile.run(
         file.id, conversationId, file.message_id, file.pending_prompt_id ?? null, file.composer_draft_id ?? null,
         file.original_name, normalizeStoredRelativePath(file.relative_path), file.source_path ?? null,
         file.mime_type, file.size, file.sha256 ?? null, file.kind, file.created_at,
+        file.presentation_mode ?? "reader", file.presentation_manifest ?? null, file.previous_file_id ?? null,
       );
+      if (payload.personalContextRevision !== undefined) {
+        this.setConversationPersonalContextRevision(conversationId, payload.personalContextRevision);
+      }
       this.sqlite.prepare(`
         UPDATE jobs SET status='completed',error=NULL,finalization_state='db_committed',
           finalization_payload=?,finalization_error=NULL,updated_at=? WHERE id=?
@@ -6165,6 +6253,14 @@ export class AppDatabase {
     const assistantNoticeId = assistantNotice ? crypto.randomUUID() : null;
     this.sqlite.exec("BEGIN IMMEDIATE");
     try {
+      const existing = this.getJob(id);
+      if (existing?.conversation_id === conversationId && existing.status === "completed"
+        && ["db_committed", "published"].includes(existing.finalization_state)) {
+        // A late notification/cleanup failure cannot undo a durable answer or
+        // reset a conversation that may already be running its next turn.
+        this.sqlite.exec("COMMIT");
+        return;
+      }
       if (status !== "completed" && this.getJob(id)?.conversation_id === conversationId) this.captureJobRecovery(id, status, error);
       this.sqlite.prepare(`
         UPDATE jobs
@@ -6220,11 +6316,20 @@ export class AppDatabase {
   }
 
   appendEvent(jobId: string, eventType: string, payload: unknown): number {
-    const row = this.sqlite.prepare("SELECT COALESCE(MAX(seq),0)+1 AS seq FROM job_events WHERE job_id=?").get(jobId) as { seq: number };
-    const now = new Date().toISOString();
-    this.sqlite.prepare("INSERT INTO job_events(job_id,seq,event_type,payload,created_at) VALUES(?,?,?,?,?)").run(jobId, row.seq, eventType, JSON.stringify(payload), now);
-    this.sqlite.prepare("UPDATE jobs SET updated_at=? WHERE id=?").run(now, jobId);
-    return row.seq;
+    // Roll back the insert too if the second write fails. A queued callback can
+    // then retry without duplicating events or leaving sequence gaps.
+    this.sqlite.exec("SAVEPOINT append_job_event");
+    try {
+      const row = this.sqlite.prepare("SELECT COALESCE(MAX(seq),0)+1 AS seq FROM job_events WHERE job_id=?").get(jobId) as { seq: number };
+      const now = new Date().toISOString();
+      this.sqlite.prepare("INSERT INTO job_events(job_id,seq,event_type,payload,created_at) VALUES(?,?,?,?,?)").run(jobId, row.seq, eventType, JSON.stringify(payload), now);
+      this.sqlite.prepare("UPDATE jobs SET updated_at=? WHERE id=?").run(now, jobId);
+      this.sqlite.exec("RELEASE append_job_event");
+      return row.seq;
+    } catch (error) {
+      this.sqlite.exec("ROLLBACK TO append_job_event; RELEASE append_job_event");
+      throw error;
+    }
   }
 
   listEvents(jobId: string, after = 0): JobEventRow[] {

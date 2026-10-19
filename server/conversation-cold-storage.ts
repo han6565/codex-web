@@ -1,3 +1,4 @@
+import { verifiedWebBody } from "./web-presentation.js";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -47,7 +48,7 @@ type StorageDbRow = {
   last_error: string | null;
 };
 
-type FileRow = {
+type FileRow = { presentation_mode?: "reader" | "web"; presentation_manifest?: string | null; sha256?: string | null;
   id: string;
   relative_path: string;
   mime_type: string;
@@ -173,7 +174,7 @@ function rowForConversation(sqlite: DatabaseSync, conversationId: string, userId
 }
 
 function fileRows(sqlite: DatabaseSync, conversationId: string): FileRow[] {
-  return sqlite.prepare("SELECT id,relative_path,mime_type,kind,size FROM files WHERE conversation_id=? ORDER BY id").all(conversationId) as FileRow[];
+  return sqlite.prepare("SELECT * FROM files WHERE conversation_id=? ORDER BY id").all(conversationId) as FileRow[];
 }
 
 function sharedFileIds(sqlite: DatabaseSync, conversationId: string): Set<string> {
@@ -332,6 +333,9 @@ function coldFileSources(
     }
     const stat = fs.lstatSync(source.absolute);
     if (!stat.isFile() || stat.isSymbolicLink()) { reasons.push("file_not_regular"); continue; }
+    if (file.presentation_mode === "web") {
+      try { verifiedWebBody(file, source.absolute); } catch { reasons.push("web_version_integrity"); continue; }
+    }
     const key = `${source.root}:${file.relative_path}`;
     if (seen.has(key)) { reasons.push("duplicate_file_path"); continue; }
     seen.add(key);
@@ -799,6 +803,12 @@ function restoreColdConversationLocked(roots: ColdStorageRoots, sqlite: Database
     if (![COLD_STORAGE_FORMAT, LEGACY_COLD_STORAGE_FORMAT].includes(manifest.format) || manifest.conversationId !== conversationId || manifest.userId !== userId || manifest.threadId !== row.codex_thread_id || manifest.generation !== row.generation) throw new Error("恢复 manifest 身份或代次不一致");
     if (JSON.stringify(manifest) !== JSON.stringify(JSON.parse(manifestJson))) throw new Error("恢复 manifest 内容与数据库不一致");
     restoreFilesFromExtract(roots, manifest, extractWork);
+    for (const file of fileRows(sqlite, conversationId)) {
+      if (file.presentation_mode !== "web") continue;
+      const source = fileSourceFor(roots, row, file);
+      if (!source) throw new Error("web_version_path_invalid");
+      verifiedWebBody(file, source.absolute);
+    }
     row = rowForConversation(sqlite, conversationId, userId)!;
     transition(sqlite, row, ["restoring"], "local", "restore_complete", { restored_at: new Date().toISOString(), last_error: null });
   } catch (error) {

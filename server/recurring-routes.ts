@@ -2,12 +2,13 @@ import type { Router, Request, Response } from "express";
 import type { AppDatabase, SessionRow } from "./db.js";
 import type { AgentSelection } from "./model-options.js";
 import type { RecurringInput } from "../src/recurring-types.js";
-import { validateRecurrence } from "./recurrence.js";
+import { validateRecurrence, previewRecurrence } from "./recurrence.js";
 import { RecurringStore, RecurringConflict } from "./recurring-store.js";
 
 export function mountRecurringRoutes(api: Router, db: AppDatabase, select: (user: string, executor: string, model: unknown, effort: unknown) => AgentSelection) {
   const store = new RecurringStore(db);
   const owner = (res: Response) => (res.locals.session as SessionRow).user_id;
+  function guardJudgment(id:string) { if(db.sqlite.prepare('SELECT 1 FROM judgment_checks WHERE task_id=?').get(id)) throw new RecurringConflict('这是判断簿的检查，请在判断详情中调整时间或停止检查。'); }
   function input(body: Record<string, unknown>, user: string, executor: string): RecurringInput {
     const name = typeof body.name === "string" ? body.name.trim() : "";
     const prompt = typeof body.prompt === "string" ? body.prompt.trim() : "";
@@ -25,6 +26,7 @@ export function mountRecurringRoutes(api: Router, db: AppDatabase, select: (user
     if (!project) return res.status(404).json({ error: "项目不存在。" });
     return res.json({ waits: db.sqlite.prepare(`SELECT w.id,w.label,w.deadline_at,w.conversation_id FROM wake_plans w JOIN conversations c ON c.id=w.conversation_id WHERE c.user_id=? AND c.project_id=? AND c.deleted_at IS NULL AND w.state='armed' ORDER BY w.deadline_at`).all(user, project.id) });
   }));
+  api.post("/recurring-tasks/preview", handle((req, res) => res.json(previewRecurrence(validateRecurrence(req.body?.schedule)))));
   api.get("/recurring-tasks", handle((_req, res) => res.json({ tasks: store.list(owner(res)) })));
   api.post("/projects/:id/recurring-tasks", handle((req, res) => {
     const user = owner(res), project = db.getActiveProjectForUser(String(req.params.id), user);
@@ -39,6 +41,7 @@ export function mountRecurringRoutes(api: Router, db: AppDatabase, select: (user
   api.patch("/recurring-tasks/:id", handle((req, res) => {
     const user = owner(res), task = store.get(user, String(req.params.id));
     if (!task) return res.status(404).json({ error: "周期任务不存在。" });
+    guardJudgment(String(req.params.id));
     if (!Number.isInteger(req.body?.revision)) throw new Error("任务版本无效。");
     if (!["active", "paused"].includes(req.body?.state)) throw new Error("任务状态无效。");
     const project = db.getActiveProjectForUser(task.project_id, user)!;
@@ -47,6 +50,7 @@ export function mountRecurringRoutes(api: Router, db: AppDatabase, select: (user
   api.post("/recurring-tasks/:id/state", handle((req, res) => {
     const user = owner(res), task = store.get(user, String(req.params.id));
     if (!task) return res.status(404).json({ error: "周期任务不存在。" });
+    guardJudgment(String(req.params.id));
     if (!Number.isInteger(req.body?.revision) || !["active", "paused"].includes(req.body?.state)) throw new Error("任务版本或状态无效。");
     if (req.body.state === "active") {
       const project = db.getActiveProjectForUser(task.project_id, user)!;
@@ -58,6 +62,7 @@ export function mountRecurringRoutes(api: Router, db: AppDatabase, select: (user
   api.delete("/recurring-tasks/:id", handle((req, res) => {
     const task = store.get(owner(res), String(req.params.id));
     if (!task) return res.status(404).json({ error: "周期任务不存在。" });
+    guardJudgment(String(req.params.id));
     if (!Number.isInteger(req.body?.revision)) throw new Error("任务版本无效。");
     store.remove(owner(res), task.id, req.body.revision);
     return res.json({ ok: true });

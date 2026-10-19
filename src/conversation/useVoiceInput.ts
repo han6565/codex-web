@@ -17,6 +17,7 @@ export type UseVoiceInputOptions = {
   maxDurationMs?: number;
   fileNamePrefix?: string;
   unsupportedMessage?: string;
+  onUploadRecording?: (audio: Blob, fileName: string, context: VoiceInputContext) => Promise<void>;
   onSendRecording?: (audio: Blob, fileName: string, context: VoiceInputContext, transcriptionIds: string[]) => Promise<void>;
   onTranscript?: (text: string, transcriptionId: string, context?: VoiceInputContext) => void;
   onSendAfterTranscription?: (text: string, transcriptionIds: string[], context?: VoiceInputContext) => void;
@@ -100,7 +101,7 @@ export function useVoiceInput(options: UseVoiceInputOptions): VoiceInputControll
   const attachmentNamesRef = useRef(options.attachmentNames ?? []);
   const optionsRef = useRef(options);
   const sessionRef = useRef<VoiceInputContext | null>(null);
-  const sessionCallbacksRef = useRef<Pick<UseVoiceInputOptions, "onTranscript" | "onSendAfterTranscription" | "onSendRecording"> | null>(null);
+  const sessionCallbacksRef = useRef<Pick<UseVoiceInputOptions, "onTranscript" | "onSendAfterTranscription" | "onSendRecording" | "onUploadRecording"> | null>(null);
   const pendingDraftRef = useRef<VoiceDraftRecord | null>(null);
   const activeDraftRef = useRef<VoiceDraftRecord | null>(null);
   const recordingStartedAtRef = useRef<number | null>(null);
@@ -207,7 +208,10 @@ export function useVoiceInput(options: UseVoiceInputOptions): VoiceInputControll
     const current = optionsRef.current;
     try {
       const callbacks = sessionCallbacksRef.current ?? current;
-      if (draft.sendAfterTranscription && callbacks.onSendRecording && !session.pendingPromptId) {
+      if (callbacks.onUploadRecording) {
+        setUploading(true);
+        await callbacks.onUploadRecording(draft.blob, draft.fileName, session);
+      } else if (draft.sendAfterTranscription && callbacks.onSendRecording && !session.pendingPromptId) {
         setUploading(true);
         const sameTarget = transcriptionConversationIdRef.current === session.conversationId && !transcriptionPendingPromptIdRef.current;
         await callbacks.onSendRecording(draft.blob, draft.fileName, session, sameTarget ? transcriptionIdsRef.current : []);
@@ -372,6 +376,7 @@ export function useVoiceInput(options: UseVoiceInputOptions): VoiceInputControll
         attachmentNames: (current.attachmentNames ?? []).slice(0, 12),
       };
       sessionCallbacksRef.current = {
+        onUploadRecording: current.onUploadRecording,
         onSendRecording: current.onSendRecording,
         onTranscript: current.onTranscript,
         onSendAfterTranscription: current.onSendAfterTranscription,
@@ -452,7 +457,7 @@ export function useVoiceInput(options: UseVoiceInputOptions): VoiceInputControll
     if (sessionRef.current && sessionRef.current.conversationId === (current.conversationId ?? null)
       && (sessionRef.current.pendingPromptId ?? null) === (current.pendingPromptId ?? null)) {
       sessionRef.current = { ...sessionRef.current, draftText: current.draftText, quoteExcerpt: current.quoteExcerpt ?? "", attachmentNames: (current.attachmentNames ?? []).slice(0, 12) };
-      sessionCallbacksRef.current = { onTranscript: current.onTranscript, onSendAfterTranscription: current.onSendAfterTranscription, onSendRecording: current.onSendRecording };
+      sessionCallbacksRef.current = { onUploadRecording: current.onUploadRecording, onTranscript: current.onTranscript, onSendAfterTranscription: current.onSendAfterTranscription, onSendRecording: current.onSendRecording };
     }
     sendAfterRef.current = sendAfterTranscription;
     setUploading(true);
